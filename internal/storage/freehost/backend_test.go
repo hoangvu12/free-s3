@@ -274,6 +274,37 @@ func TestDownloadRangeBytesFailsOverStalledLead(t *testing.T) {
 	}
 }
 
+// TestDownloadRangeBytesHedgesSlowLead: the lead replica stalls but the
+// per-replica backstop is long; the hedge timer must race the next replica and
+// the read must complete in ~hedgeDelay, NOT wait for the backstop. This proves
+// hedging (not just timeout-failover) is what serves a slow lead quickly.
+func TestDownloadRangeBytesHedgesSlowLead(t *testing.T) {
+	p1 := newFakeProvider("x0.at", true, 1<<30)
+	p2 := newFakeProvider("fileditch", true, 1<<30)
+	b := newTestBackend(t, 2, 100, p1, p2)
+	b.replicaRead = 10 * time.Second   // long backstop: must NOT be what saves us
+	b.hedgeDelay = 30 * time.Millisecond
+	chunks, err := b.Upload(context.Background(), "k", "ct", strings.NewReader("payload-bytes"))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	ref := refOf(chunks[0])
+	b.pool.get(ref.Replicas[0].Provider).(*fakeProvider).setStall(true) // lead stalls forever
+
+	start := time.Now()
+	got, err := b.DownloadRangeBytes(context.Background(), ref, 0, 0)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("DownloadRangeBytes hedged: %v", err)
+	}
+	if string(got) != "payload-bytes" {
+		t.Fatalf("hedged read = %q, want %q", got, "payload-bytes")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("hedged read took %v — hedge did not race past the stalled lead (backstop was 10s)", elapsed)
+	}
+}
+
 // TestDownloadRangeBytesPartialRange: offset/length must be honored on the
 // replica that serves.
 func TestDownloadRangeBytesPartialRange(t *testing.T) {

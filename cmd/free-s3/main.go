@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,7 +19,7 @@ import (
 )
 
 func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -52,6 +53,7 @@ func main() {
 		ReplicationFactor:  cfg.ReplicationFactor,
 		UploadConcurrency:  cfg.UploadConcurrency,
 		ReplicaReadTimeout: cfg.ReplicaReadTimeout,
+		ReadHedgeDelay:     cfg.ReadHedgeDelay,
 		Logger:             logger,
 	})
 	if err != nil {
@@ -103,5 +105,22 @@ func main() {
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
 		logger.Error("shutdown failed", "error", err)
+	}
+}
+
+// logLevel reads LOG_LEVEL (debug|info|warn|error, default info). Set to debug
+// to surface per-replica read timing (which host served each window, how fast,
+// and whether the read was hedged) for tuning provider order from a given egress
+// IP; revert to info in steady state to avoid one log line per prefetch window.
+func logLevel() slog.Level {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("LOG_LEVEL"))) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
 	}
 }

@@ -26,7 +26,8 @@ type Backend struct {
 	chunkSize   int64
 	replicas    int // R
 	uploadConc  int
-	replicaRead time.Duration // per-replica read deadline before failover (0 = no per-replica cap)
+	replicaRead time.Duration // per-replica read deadline / backstop (0 = no per-replica cap)
+	hedgeDelay  time.Duration // wait before racing the next replica on a slow lead (0 = no hedging, pure failover)
 	logger      *slog.Logger
 }
 
@@ -37,6 +38,7 @@ type Options struct {
 	ReplicationFactor  int
 	UploadConcurrency  int
 	ReplicaReadTimeout time.Duration
+	ReadHedgeDelay     time.Duration
 	Logger             *slog.Logger
 }
 
@@ -72,6 +74,7 @@ func New(opts Options) (*Backend, error) {
 		replicas:    opts.ReplicationFactor,
 		uploadConc:  opts.UploadConcurrency,
 		replicaRead: opts.ReplicaReadTimeout,
+		hedgeDelay:  opts.ReadHedgeDelay,
 		logger:      logger,
 	}, nil
 }
@@ -210,46 +213,124 @@ func (b *Backend) openReplica(ctx context.Context, ref storage.ChunkRef, offset,
 	return nil, fmt.Errorf("freehost: all replicas failed: %w", lastErr)
 }
 
-// DownloadRangeBytes reads [offset, offset+length) of one chunk into memory,
-// trying each replica in order under a per-replica deadline and failing over to
-// the next replica on error/timeout. length <= 0 means "to end of chunk". This
-// is the hot read path's window fetch: because each window is bounded (the
-// reader's prefetch size, e.g. 4 MiB) buffering it is cheap, and the per-replica
-// deadline means a slow/throttled lead host (pixeldrain from a datacenter IP,
-// catbox's bandwidth cap, IA's ingestion lag) is abandoned in seconds and the
-// next replica serves — instead of the whole stream stalling on replica[0] until
-// the caller's window timeout cancels it mid-copy (the old behavior, which had
-// no failover). Read slowness is logged but does NOT mutate pool health, which
-// is fed by upload outcomes + the keepalive Verify sweep.
+// DownloadRangeBytes reads [offset, offset+length) of one chunk into memory
+// using HEDGED reads across the chunk's replicas. length <= 0 means "to end of
+// chunk". This is the hot read path's window fetch.
+//
+// Why hedged and not just sequential failover: free hosts are fast to WRITE but
+// often throttled to READ from a datacenter IP (measured: fileditch uploads a
+// 6MB chunk in ~0.3s but serves it back at ~140KB/s), and pool.candidates()
+// round-robin-rotates the durable tier so the stored replica[0] is effectively
+// random — we cannot statically guarantee a fast read lead. So instead of
+// committing to one replica and only failing over after it times out (which, on
+// a many-window object, compounds an 18s penalty per window), we:
+//   - start the lead replica immediately,
+//   - if it hasn't delivered the whole window within hedgeDelay, start the next
+//     replica concurrently and keep racing (and likewise on each error),
+//   - return the FIRST replica to deliver the full window, cancelling the rest.
+// A slow lead therefore costs ~hedgeDelay (e.g. 2s), not the full per-replica
+// deadline, and it is order-independent. Each replica is still backstopped by
+// replicaRead. Because the window is bounded (the reader's prefetch size, e.g.
+// 4 MiB) buffering a few concurrent copies is cheap. Read outcomes are logged
+// but do NOT mutate pool health (that is upload/Verify-driven).
 func (b *Backend) DownloadRangeBytes(ctx context.Context, ref storage.ChunkRef, offset, length int64) ([]byte, error) {
-	var lastErr error
+	type cand struct {
+		name string
+		prov Provider
+		loc  string
+	}
+	var cands []cand
 	for _, rep := range ref.Replicas {
-		prov := b.pool.get(rep.Provider)
-		if prov == nil {
-			lastErr = fmt.Errorf("freehost: provider %q not enabled", rep.Provider)
-			continue
+		if prov := b.pool.get(rep.Provider); prov != nil {
+			cands = append(cands, cand{name: rep.Provider, prov: prov, loc: rep.Locator})
 		}
-		rctx := ctx
-		var cancel context.CancelFunc
-		if b.replicaRead > 0 {
-			rctx, cancel = context.WithTimeout(ctx, b.replicaRead)
+	}
+	if len(cands) == 0 {
+		return nil, errors.New("freehost: chunk has no enabled replicas")
+	}
+
+	raceCtx, cancelAll := context.WithCancel(ctx)
+	defer cancelAll()
+
+	type res struct {
+		name    string
+		buf     []byte
+		err     error
+		elapsed time.Duration
+	}
+	results := make(chan res, len(cands))
+	launch := func(c cand) {
+		go func() {
+			rctx := raceCtx
+			var cancel context.CancelFunc
+			if b.replicaRead > 0 {
+				rctx, cancel = context.WithTimeout(raceCtx, b.replicaRead)
+				defer cancel()
+			}
+			start := time.Now()
+			buf, err := readReplicaBytes(rctx, c.prov, c.loc, offset, length)
+			results <- res{name: c.name, buf: buf, err: err, elapsed: time.Since(start)}
+		}()
+	}
+
+	next := 0
+	inflight := 0
+	launch(cands[next])
+	next++
+	inflight++
+
+	var timer *time.Timer
+	var hedgeC <-chan time.Time
+	armHedge := func() {
+		if timer != nil {
+			timer.Stop()
+			timer = nil
 		}
-		start := time.Now()
-		buf, err := readReplicaBytes(rctx, prov, rep.Locator, offset, length)
-		elapsed := time.Since(start)
-		if cancel != nil {
-			cancel()
+		if next < len(cands) && b.hedgeDelay > 0 {
+			timer = time.NewTimer(b.hedgeDelay)
+			hedgeC = timer.C
+		} else {
+			hedgeC = nil
 		}
-		if err != nil {
-			lastErr = err
-			b.logger.Warn("freehost: replica range read failed, failing over",
-				"provider", rep.Provider, "offset", offset, "want", length,
-				"got", len(buf), "elapsed_ms", elapsed.Milliseconds(), "error", err)
-			continue
+	}
+	armHedge()
+
+	var lastErr error
+	for inflight > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-hedgeC:
+			// Lead is slow — race the next replica concurrently instead of
+			// waiting for the lead to time out.
+			if next < len(cands) {
+				b.logger.Debug("freehost: hedging range read", "next_provider", cands[next].name, "offset", offset)
+				launch(cands[next])
+				next++
+				inflight++
+			}
+			armHedge()
+		case r := <-results:
+			inflight--
+			if r.err == nil {
+				b.logger.Debug("freehost: replica range read ok",
+					"provider", r.name, "offset", offset, "bytes", len(r.buf),
+					"elapsed_ms", r.elapsed.Milliseconds(), "hedged", next > 1)
+				return r.buf, nil // defer cancelAll() abandons the losers
+			}
+			lastErr = r.err
+			b.logger.Warn("freehost: replica range read failed",
+				"provider", r.name, "offset", offset, "want", length,
+				"got", len(r.buf), "elapsed_ms", r.elapsed.Milliseconds(), "error", r.err)
+			// A replica failed: immediately bring in the next one (don't wait
+			// for the hedge timer) so we keep len(cands) attempts available.
+			if next < len(cands) {
+				launch(cands[next])
+				next++
+				inflight++
+				armHedge()
+			}
 		}
-		b.logger.Debug("freehost: replica range read ok",
-			"provider", rep.Provider, "offset", offset, "bytes", len(buf), "elapsed_ms", elapsed.Milliseconds())
-		return buf, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("freehost: chunk has no replicas")

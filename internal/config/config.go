@@ -45,6 +45,12 @@ type Config struct {
 	// from a datacenter IP) from hanging a GET. Keep it < ChunkTimeout / R so
 	// every replica gets a turn before the window's overall deadline.
 	ReplicaReadTimeout time.Duration
+	// ReadHedgeDelay is how long the reader waits for the lead replica to
+	// deliver a window before ALSO racing the next replica (hedged reads). A
+	// slow lead then costs ~this delay instead of the full ReplicaReadTimeout,
+	// and it is order-independent (the durable tier is round-robin rotated, so
+	// the stored lead replica is effectively random). 0 disables hedging.
+	ReadHedgeDelay time.Duration
 
 	// --- freehost backend knobs ----------------------------------------
 	// ReplicationFactor (R) is the number of distinct providers each chunk is
@@ -84,6 +90,7 @@ func Load() (Config, error) {
 		ChunkTimeout:            getDuration("CHUNK_TIMEOUT", 60*time.Second),
 		StreamChunkSize:         getBytes("STREAM_CHUNK_SIZE", 4<<20),
 		ReplicaReadTimeout:      getDuration("REPLICA_READ_TIMEOUT", 18*time.Second),
+		ReadHedgeDelay:          getDuration("READ_HEDGE_DELAY", 2*time.Second),
 		ReplicationFactor:       getInt("REPLICATION_FACTOR", 3),
 		ChunkSize:               getBytes("CHUNK_SIZE", 80<<20),
 		FreehostProviders:       parseCSVList(os.Getenv("FREEHOST_PROVIDERS")),

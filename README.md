@@ -82,7 +82,10 @@ See [`.env.example`](.env.example) for the full list. Key variables:
 | `CHUNK_SIZE` | `80MiB` | per-chunk window (under catbox's 200 MB cap) |
 | `FREEHOST_PROVIDERS` | built-in default | enabled providers, priority order |
 | `UPLOAD_CONCURRENCY` | `6` | parallel chunk-replica uploads |
+| `REPLICA_READ_TIMEOUT` | `18s` | per-replica read backstop before giving up on it |
+| `READ_HEDGE_DELAY` | `2s` | wait for the lead replica before racing the next (hedged reads) |
 | `KEEPALIVE_INTERVAL` | `24h` | self-heal sweep cadence (`0` = off) |
+| `LOG_LEVEL` | `info` | `debug` logs per-replica read timing (which host served, how fast, hedged?) |
 | `CATBOX_USERHASH` | — | **required for catbox from a VPS** (anon = 412) |
 | `PIXELDRAIN_API_KEY` | — | optional; longer retention |
 | `IA_ACCESS_KEY` / `IA_SECRET_KEY` | — | enables the Internet Archive anchor |
