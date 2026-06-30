@@ -30,7 +30,7 @@ S3 client (aws-sdk / rclone / restic / boto3)
         ├─ backend   : Upload (chunk→R providers), Download (first healthy replica),
         │              Delete (all replicas), RepairChunk (self-heal)
         └─ providers : ia, fileditch, pixeldrain, catbox, gofile, buzzheavier,
-                       x0.at/envs.sh/ttm.sh/fars.ee, pomf.lain.la/uguu/tmp.ninja/
+                       x0.at/envs.sh/ttm.sh, pomf.lain.la/uguu/tmp.ninja/
                        doko.moe/cockfile, temp.sh/litterbox/tmpfiles/tmpfile.link,
                        paste.c-net.org, filebin.net
   internal/keepalive ── periodic TTL-refresh + self-heal sweep

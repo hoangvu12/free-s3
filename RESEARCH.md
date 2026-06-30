@@ -101,7 +101,7 @@ genuine HTTP/S3 APIs and true raw-bytes direct URLs.
 | **x0.at** | 1 GiB | 3→100 days | none; `X-Token` | ✅ plaintext (confirmed NOT DC-blocked) | 🟢 |
 | **pomf.lain.la** | 1 GiB | long-term (dedic. HW) | none | ✅ JSON `files[].url` | 🟢 |
 | **buzzheavier.com** | — | activity-based | optional Bearer | ✅ `PUT` raw-body, direct link | 🟡 |
-| **fars.ee** | large | no default expiry (`sunset=` opt) | none (UUID for mgmt) | ✅ plaintext (field `c`, behind Cloudflare) | 🟢 |
+| ~~**fars.ee**~~ | — | — | — | ❌ **DROPPED** — live testing showed it is `ptpb/pb`, a text pastebin ("do NOT post large files"), not a file host | ⛔ |
 | **paste.c-net.org** | 50 MB | 180 days (rolling on access) | none | ✅ plaintext (raw `PUT --upload-file`) | 🟢 |
 
 ## Tier B — TEMP / SCRATCH / OVERFLOW (arbitrary types · expiring · always re-derivable from a replica)

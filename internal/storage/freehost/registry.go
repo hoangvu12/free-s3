@@ -20,10 +20,11 @@ type Credentials struct {
 // re-verified from the deploy IP) but are NOT in the default:
 //   - dead regardless of IP: envs.sh & cockfile (DNS gone), pomf.lain.la
 //     (discontinued, 404), tmp.ninja (404), ttm.sh (POST now returns HTML)
-//   - blocked from this IP (re-test on the VPS): paste.c-net.org (403
-//     Blacklisted), doko.moe (connection reset)
-//   - marginal: fars.ee (409 "label already exists")
+//   - blocked from this IP (re-test on the VPS): paste.c-net.org (whole-site 403
+//     Blacklisted), doko.moe (upload connection reset)
 //   - opt-in-only (token-gated / docs-derived): gofile, buzzheavier
+// (fars.ee was dropped entirely: it is a ptpb/pb text pastebin that forbids
+// large files, not a file host.)
 // temp.sh and filebin.net initially served HTML on read; their adapters now do
 // the POST-to-download (temp.sh) / verified-cookie 302 (filebin) dance and pass.
 //
@@ -77,7 +78,6 @@ var registry = map[string]providerFactory{
 	"x0.at":   func(c *Client, _ Credentials) (Provider, bool) { return NewX0(c), true },
 	"envs.sh": func(c *Client, _ Credentials) (Provider, bool) { return NewEnvsSh(c), true },
 	"ttm.sh":  func(c *Client, _ Credentials) (Provider, bool) { return NewTtmSh(c), true },
-	"fars.ee": func(c *Client, _ Credentials) (Provider, bool) { return NewFarsee(c), true },
 	// pomf family.
 	"pomf.lain.la": func(c *Client, _ Credentials) (Provider, bool) { return NewPomfLainLa(c), true },
 	"uguu":         func(c *Client, _ Credentials) (Provider, bool) { return NewUguu(c), true },

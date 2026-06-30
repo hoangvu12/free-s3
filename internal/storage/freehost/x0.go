@@ -10,11 +10,11 @@ import (
 // zerox is the generalized 0x0-family provider: POST a multipart file field to
 // the host root, get a plaintext direct URL back, with an optional X-Token
 // response header used for deletion (0x0 protocol: POST the file URL with
-// token=+delete=). Covers x0.at, envs.sh, ttm.sh (field "file", X-Token) and
-// fars.ee (field "c", UUID-managed, no X-Token).
+// token=+delete=). Covers x0.at, envs.sh, ttm.sh (field "file", X-Token).
 //
 // 0x0.st itself is intentionally absent: it refuses datacenter IPs (RESEARCH.md
-// gotcha #2). x0.at is the DC-friendly member.
+// gotcha #2). x0.at is the DC-friendly member. fars.ee was removed: it is a
+// ptpb/pb text pastebin ("do NOT post large files"), not a file host.
 type zerox struct {
 	c       *Client
 	name    string
@@ -38,12 +38,6 @@ func NewEnvsSh(c *Client) *zerox {
 // NewTtmSh is ttm.sh: ~256 MiB, temp tier, X-Token.
 func NewTtmSh(c *Client) *zerox {
 	return &zerox{c: c, name: "ttm.sh", host: "https://ttm.sh", field: "file", maxByte: 256 << 20, durable: false, token: true}
-}
-
-// NewFarsee is fars.ee: large, no default expiry, field "c", UUID-managed (no
-// X-Token); we treat it as durable.
-func NewFarsee(c *Client) *zerox {
-	return &zerox{c: c, name: "fars.ee", host: "https://fars.ee", field: "c", maxByte: 1 << 30, durable: true, token: false}
 }
 
 func (p *zerox) Name() string    { return p.name }

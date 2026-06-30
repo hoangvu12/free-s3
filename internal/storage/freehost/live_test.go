@@ -88,7 +88,6 @@ func TestLiveCatbox(t *testing.T) {
 func TestLiveX0(t *testing.T)      { liveRoundTrip(t, NewX0(NewClient(0))) }
 func TestLiveEnvsSh(t *testing.T)  { liveRoundTrip(t, NewEnvsSh(NewClient(0))) }
 func TestLiveTtmSh(t *testing.T)   { liveRoundTrip(t, NewTtmSh(NewClient(0))) }
-func TestLiveFarsee(t *testing.T)  { liveRoundTrip(t, NewFarsee(NewClient(0))) }
 func TestLivePomf(t *testing.T)    { liveRoundTrip(t, NewPomfLainLa(NewClient(0))) }
 func TestLiveTempSh(t *testing.T)  { liveRoundTrip(t, NewTempSh(NewClient(0))) }
 func TestLivePaste(t *testing.T)   { liveRoundTrip(t, NewPasteCNet(NewClient(0))) }
