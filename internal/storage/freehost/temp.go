@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 )
 
@@ -37,8 +38,12 @@ func (p *TempSh) Upload(ctx context.Context, data []byte, filename, contentType 
 	return locator, "", nil
 }
 
+// Download POSTs to the file URL — temp.sh serves the bytes only via the page's
+// "click to download" form (a plain GET returns an HTML preview). It ignores
+// Range and returns the whole file (200), so rangeGetMethod emulates the window
+// client-side; fine for a non-durable overflow host that rarely serves reads.
 func (p *TempSh) Download(ctx context.Context, locator string, offset, length int64) (io.ReadCloser, error) {
-	return p.c.rangeGet(ctx, locator, offset, length, nil)
+	return p.c.rangeGetMethod(ctx, http.MethodPost, locator, offset, length, nil)
 }
 func (p *TempSh) Delete(ctx context.Context, locator, deleteToken string) error { return nil }
 

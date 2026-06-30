@@ -5,20 +5,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 )
 
 // Fileditch — anonymous, permanent, 100 GB/file. POST multipart field "file" to
-// upload.php; the response is JSON carrying the direct URL. It blocks script
-// extensions (php/html/js/exe/apk/sh/py/bat), so chunk blobs must be named
-// `.bin` (RESEARCH.md gotcha #5). No delete API.
+// upload.php; the response JSON's "url" is an HTML landing page (NOT a raw
+// hotlink — fileditch stopped serving direct links in 2026). The page embeds a
+// freshly-signed, expiring direct URL on a separate host, which we scrape per
+// read (see Download). It blocks script extensions (php/html/js/exe/apk/sh/py/
+// bat), so chunk blobs must be named `.bin` (RESEARCH.md gotcha #5). No delete API.
 type Fileditch struct {
 	c        *Client
 	endpoint string
 }
 
 func NewFileditch(c *Client) *Fileditch {
-	return &Fileditch{c: c, endpoint: "https://up.fileditch.com/upload.php"}
+	// Permanent storage endpoint (the old up.fileditch.com host is dead as of
+	// 2026; verified live). Success JSON carries a top-level "url" pointing at
+	// fileditchfiles.me; temp.fileditch.com is the 72h-expiry variant.
+	return &Fileditch{c: c, endpoint: "https://new.fileditch.com/upload.php"}
 }
 
 func (p *Fileditch) Name() string    { return "fileditch" }
@@ -62,8 +68,32 @@ func (p *Fileditch) Upload(ctx context.Context, data []byte, filename, contentTy
 	return locator, "", nil
 }
 
+// fileditchDirectRe matches the signed, expiring direct-download URL embedded in
+// the landing page (e.g. https://<host>/path/file.bin?md5=...&expires=...). The
+// host name varies/rotates, so we key off the md5= query marker, not the host.
+var fileditchDirectRe = regexp.MustCompile(`https://[^"'\s]+?[?&]md5=[^"'\s]+`)
+
+// resolveDirect fetches the landing page and extracts the current signed direct
+// URL. The signed link expires, but the landing page (the stored locator) is
+// stable and mints a fresh one on each load — so we scrape on every read.
+func (p *Fileditch) resolveDirect(ctx context.Context, landing string) (string, error) {
+	html, err := p.c.getString(ctx, landing, 1<<20)
+	if err != nil {
+		return "", fmt.Errorf("fileditch: fetch landing %s: %w", landing, err)
+	}
+	m := fileditchDirectRe.FindString(html)
+	if m == "" {
+		return "", fmt.Errorf("fileditch: no signed direct link in landing page %s", landing)
+	}
+	return strings.ReplaceAll(m, "&amp;", "&"), nil // un-HTML-escape the query
+}
+
 func (p *Fileditch) Download(ctx context.Context, locator string, offset, length int64) (io.ReadCloser, error) {
-	return p.c.rangeGet(ctx, locator, offset, length, nil)
+	direct, err := p.resolveDirect(ctx, locator)
+	if err != nil {
+		return nil, err
+	}
+	return p.c.rangeGet(ctx, direct, offset, length, nil)
 }
 
 func (p *Fileditch) Delete(ctx context.Context, locator, deleteToken string) error {

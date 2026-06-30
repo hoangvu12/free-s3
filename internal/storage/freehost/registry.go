@@ -13,31 +13,38 @@ type Credentials struct {
 	GofileToken      string
 }
 
-// defaultProviderOrder is the enabled set + priority used when FREEHOST_PROVIDERS
-// is empty. It lists the providers whose mechanics are verified (RESEARCH.md 🟢)
-// and datacenter-friendly, anchored by Internet Archive. The opt-in-only set
-// (gofile, buzzheavier — docs-derived/🟡, or needing a token) is in the registry
-// but not the default; enable explicitly via FREEHOST_PROVIDERS once verified.
+// defaultProviderOrder is the verified-good set from live smoke testing
+// (2026-07-01, from a residential IP), in read-priority order. Every host here
+// passed an upload / full-GET / range / delete round-trip. Hosts that failed are
+// kept in the registry (opt back in via FREEHOST_PROVIDERS once fixed or
+// re-verified from the deploy IP) but are NOT in the default:
+//   - dead regardless of IP: envs.sh & cockfile (DNS gone), pomf.lain.la
+//     (discontinued, 404), tmp.ninja (404), ttm.sh (POST now returns HTML)
+//   - blocked from this IP (re-test on the VPS): paste.c-net.org (403
+//     Blacklisted), doko.moe (connection reset)
+//   - marginal: fars.ee (409 "label already exists")
+//   - opt-in-only (token-gated / docs-derived): gofile, buzzheavier
+// temp.sh and filebin.net initially served HTML on read; their adapters now do
+// the POST-to-download (temp.sh) / verified-cookie 302 (filebin) dance and pass.
+//
+// Ordering rationale: pixeldrain is the fastest clean direct link, so it leads;
+// fileditch is permanent/no-auth (landing-page scrape on read); IA is the
+// permanent anchor but ingests asynchronously (a just-uploaded file 404s
+// briefly), so it sits at 3 rather than 0 so fresh reads don't eat a failed IA
+// fetch first; catbox/litterbox work but are bandwidth-throttled, so they trail
+// as durable backups rather than primary read sources.
 var defaultProviderOrder = []string{
-	"ia",           // permanent anchor (if credentialed)
-	"fileditch",    // durable, 100GB, no auth
-	"pixeldrain",   // durable (keep-alive)
-	"catbox",       // durable (needs userhash from VPS)
+	"pixeldrain",   // durable, fast, clean direct link
+	"fileditch",    // durable, 100GB, no auth (landing-page scrape on read)
+	"ia",           // permanent anchor (if credentialed; ingestion delay on read)
 	"x0.at",        // durable, DC-friendly
-	"pomf.lain.la", // durable, dedicated HW
-	"paste.c-net.org",
-	"temp.sh", // overflow / scratch
-	"litterbox",
-	"tmpfiles.org",
-	"tmpfile.link",
-	"filebin.net",
-	"envs.sh",
-	"ttm.sh",
-	"fars.ee",
-	"uguu",
-	"tmp.ninja",
-	"doko.moe",
-	"cockfile",
+	"catbox",       // durable but throttled (needs userhash from VPS)
+	"uguu",         // temp/overflow, fast
+	"tmpfiles.org", // temp/overflow
+	"tmpfile.link", // temp/overflow
+	"temp.sh",      // temp/overflow, 4GB (POST-to-download)
+	"filebin.net",  // temp/overflow, ~6d (verified-cookie 302 download)
+	"litterbox",    // temp, throttled (catbox infra) — backup
 }
 
 // providerFactory builds a provider, returning ok=false when a required

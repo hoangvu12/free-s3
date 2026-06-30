@@ -223,6 +223,29 @@ func (c *Client) deleteWithHeaders(ctx context.Context, url string, headers map[
 	return resp.StatusCode, slurp(resp), nil
 }
 
+// getString GETs url and returns up to maxBytes of the body as a string. Used
+// by providers that must scrape an HTML landing page for the real direct link
+// (fileditch). It uses the download timeout and the browser UA.
+func (c *Client) getString(ctx context.Context, url string, maxBytes int64) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, defaultDownloadTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("freehost: GET %s -> %d", url, resp.StatusCode)
+	}
+	return string(b), nil
+}
+
 // slurp reads up to errBodyLimit bytes of a response body for inclusion in an
 // error message (and to validate plaintext-URL responses). It always drains +
 // closes so the connection can be reused.
@@ -238,8 +261,16 @@ func slurp(resp *http.Response) string {
 // ignores Range and returns 200, the slice is emulated client-side (RESEARCH.md:
 // most hosts honor Range; the fallback keeps correctness for those that don't).
 func (c *Client) rangeGet(ctx context.Context, url string, offset, length int64, extraHeaders map[string]string) (io.ReadCloser, error) {
+	return c.rangeGetMethod(ctx, http.MethodGet, url, offset, length, extraHeaders)
+}
+
+// rangeGetMethod is rangeGet with an explicit HTTP method. A few hosts serve the
+// file body only in response to a POST on the file URL (temp.sh's "click to
+// download" form); they ignore Range and return 200, so the requested window is
+// emulated client-side by the 200 branch below.
+func (c *Client) rangeGetMethod(ctx context.Context, method, url string, offset, length int64, extraHeaders map[string]string) (io.ReadCloser, error) {
 	ctx, cancel := context.WithTimeout(ctx, defaultDownloadTimeout)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
 		cancel()
 		return nil, err

@@ -51,8 +51,14 @@ func (p *Filebin) Upload(ctx context.Context, data []byte, filename, contentType
 	return url, bin, nil // deleteToken carries the bin for DELETE /{bin}
 }
 
+// filebinVerifiedCookie satisfies filebin's anti-bot gate: a bare GET of the
+// file URL returns an HTML interstitial that sets `verified=<date>`; sending
+// that cookie back makes filebin 302 to a presigned (Range-capable) storage URL
+// with the raw bytes. The value is the fixed constant filebin issues.
+const filebinVerifiedCookie = "verified=2024-05-24"
+
 func (p *Filebin) Download(ctx context.Context, locator string, offset, length int64) (io.ReadCloser, error) {
-	return p.c.rangeGet(ctx, locator, offset, length, nil)
+	return p.c.rangeGet(ctx, locator, offset, length, map[string]string{"Cookie": filebinVerifiedCookie})
 }
 
 func (p *Filebin) Delete(ctx context.Context, locator, deleteToken string) error {
