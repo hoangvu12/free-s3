@@ -9,45 +9,45 @@ import (
 	"free-s3/internal/storage"
 )
 
-// ChunkLoc maps one Telegram message to its object-space byte range. The
-// reader translates the prefetch's object-space offset to (ref, localOff)
-// pairs by binary-searching this list.
+// ChunkLoc maps one stored chunk to its object-space byte range. The reader
+// translates the prefetch's object-space offset to (ref, localOff) pairs by
+// binary-searching this list.
 type ChunkLoc struct {
 	Ref    storage.ChunkRef
-	Offset int64 // object-space offset where this message's first byte sits
+	Offset int64 // object-space offset where this chunk's first byte sits
 	Size   int64
 }
 
-// BotSource is a ChunkSource that translates object-space prefetch reads
-// into Backend.DownloadRange calls against the underlying Telegram
-// messages. One BotSource per object; locs must be sorted by Offset.
+// backendSource is a reader.ChunkSource that translates object-space prefetch
+// reads into Backend.DownloadRange calls against the underlying stored chunks
+// (each fetched from the first healthy free-host replica). One per object; locs
+// must be sorted by Offset.
 //
-// A single Chunk call may straddle Telegram message boundaries when the
-// prefetch chunkSize doesn't align with the upload chunk size (e.g. a 4
-// MiB prefetch over an object whose upload chunks were 3 MiB).
-// BotSource issues sequential DownloadRange calls and concatenates the
-// results in that case; callers should size their prefetch chunks to fit
-// within the upload chunks for best performance.
-type BotSource struct {
+// A single Chunk call may straddle stored-chunk boundaries when the prefetch
+// chunkSize doesn't align with the upload chunk size. backendSource issues
+// sequential DownloadRange calls and concatenates the results in that case;
+// callers should size their prefetch chunks to fit within the upload chunks
+// for best performance.
+type backendSource struct {
 	backend   storage.Backend
 	objSize   int64
 	locs      []ChunkLoc
 	chunkSize int64 // configured prefetch chunk size (object-space); halved for tiny ranges
 }
 
-// NewBotSource constructs a source over the given chunk map. objSize is
+// NewChunkSource constructs a source over the given chunk map. objSize is
 // the total object size; locs must be sorted by Offset and cover the
 // whole object (object_chunks rows). chunkSize is the prefetch window
 // (e.g. 4 MiB); it does not need to align with the upload chunks.
-func NewBotSource(backend storage.Backend, objSize int64, locs []ChunkLoc, chunkSize int64) *BotSource {
-	return &BotSource{backend: backend, objSize: objSize, locs: locs, chunkSize: chunkSize}
+func NewChunkSource(backend storage.Backend, objSize int64, locs []ChunkLoc, chunkSize int64) *backendSource {
+	return &backendSource{backend: backend, objSize: objSize, locs: locs, chunkSize: chunkSize}
 }
 
 // ChunkSize returns the prefetch window, halved for tiny ranges so a
 // 100-byte Range request doesn't fetch 4 MiB just to throw most of it
 // away. Floor is 64 KiB so even a small read still amortizes the
 // per-fetch overhead (getFile + TLS).
-func (s *BotSource) ChunkSize(start, end int64) int64 {
+func (s *backendSource) ChunkSize(start, end int64) int64 {
 	cs := s.chunkSize
 	if cs <= 0 {
 		cs = 1 << 22 // 4 MiB
@@ -63,7 +63,7 @@ func (s *BotSource) ChunkSize(start, end int64) int64 {
 // stitching together multiple DownloadRange calls if the range straddles
 // a chunk boundary. A read past objSize returns the available prefix and
 // silently truncates (the parallel reader's alignedEnd may overshoot).
-func (s *BotSource) Chunk(ctx context.Context, offset, limit int64) ([]byte, error) {
+func (s *backendSource) Chunk(ctx context.Context, offset, limit int64) ([]byte, error) {
 	if offset >= s.objSize {
 		return nil, nil
 	}
@@ -107,7 +107,7 @@ func (s *BotSource) Chunk(ctx context.Context, offset, limit int64) ([]byte, err
 // locate returns the loc containing the given object-space offset along
 // with the offset *within* that message's bytes. Binary search keeps
 // large chunk maps cheap (a 1 TiB object at 18 MiB chunks has ~57k locs).
-func (s *BotSource) locate(offset int64) (ChunkLoc, int64, bool) {
+func (s *backendSource) locate(offset int64) (ChunkLoc, int64, bool) {
 	i := sort.Search(len(s.locs), func(i int) bool {
 		return s.locs[i].Offset > offset
 	}) - 1

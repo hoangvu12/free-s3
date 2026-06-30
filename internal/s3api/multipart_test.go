@@ -23,16 +23,28 @@ import (
 )
 
 // fakeBackend is an in-memory storage.Backend that splits like the real one.
+// Each chunk gets a single replica whose Locator keys an in-memory blob map,
+// so the tests observe upload/reap through files (live blobs) and deleted
+// (reaped locators).
 type fakeBackend struct {
 	mu        sync.Mutex
 	chunkSize int
-	files     map[string][]byte
-	deleted   map[int64]bool
+	files     map[string][]byte // locator -> bytes
+	deleted   map[string]bool   // locator -> reaped
 	seq       int64
 }
 
 func newFakeBackend(chunkSize int) *fakeBackend {
-	return &fakeBackend{chunkSize: chunkSize, files: map[string][]byte{}, deleted: map[int64]bool{}}
+	return &fakeBackend{chunkSize: chunkSize, files: map[string][]byte{}, deleted: map[string]bool{}}
+}
+
+// refLocator returns a ref's first replica locator (the fake stores one
+// replica per chunk).
+func refLocator(ref storage.ChunkRef) string {
+	if len(ref.Replicas) == 0 {
+		return ""
+	}
+	return ref.Replicas[0].Locator
 }
 
 func (f *fakeBackend) Upload(_ context.Context, _, _ string, body io.Reader) ([]storage.Chunk, error) {
@@ -49,35 +61,35 @@ func (f *fakeBackend) Upload(_ context.Context, _, _ string, body io.Reader) ([]
 		piece := append([]byte(nil), data[off:end]...)
 		f.mu.Lock()
 		f.seq++
-		fid := fmt.Sprintf("f%d", f.seq)
-		mid := 1000 + f.seq
-		f.files[fid] = piece
+		loc := fmt.Sprintf("loc%d", f.seq)
+		f.files[loc] = piece
 		f.mu.Unlock()
-		chunks = append(chunks, storage.Chunk{Seq: seq, FileID: fid, MessageID: mid, Size: int64(len(piece)), Offset: int64(off), Transport: storage.TransportMTProto})
+		chunks = append(chunks, storage.Chunk{Seq: seq, Size: int64(len(piece)), Offset: int64(off),
+			Replicas: []storage.Replica{{Provider: "fake", Locator: loc}}})
 		off = end
 	}
 	return chunks, nil
 }
 
-func (f *fakeBackend) get(fileID string) ([]byte, bool) {
+func (f *fakeBackend) get(locator string) ([]byte, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	b, ok := f.files[fileID]
+	b, ok := f.files[locator]
 	return b, ok
 }
 
 func (f *fakeBackend) Download(_ context.Context, ref storage.ChunkRef) (io.ReadCloser, error) {
-	b, ok := f.get(ref.BotFileID)
+	b, ok := f.get(refLocator(ref))
 	if !ok {
-		return nil, fmt.Errorf("no such file %s", ref.BotFileID)
+		return nil, fmt.Errorf("no such blob %s", refLocator(ref))
 	}
 	return io.NopCloser(bytes.NewReader(b)), nil
 }
 
 func (f *fakeBackend) DownloadRange(_ context.Context, ref storage.ChunkRef, offset, length int64) (io.ReadCloser, error) {
-	b, ok := f.get(ref.BotFileID)
+	b, ok := f.get(refLocator(ref))
 	if !ok {
-		return nil, fmt.Errorf("no such file %s", ref.BotFileID)
+		return nil, fmt.Errorf("no such blob %s", refLocator(ref))
 	}
 	if offset > int64(len(b)) {
 		offset = int64(len(b))
@@ -92,8 +104,10 @@ func (f *fakeBackend) DownloadRange(_ context.Context, ref storage.ChunkRef, off
 func (f *fakeBackend) Delete(_ context.Context, ref storage.ChunkRef) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.deleted[ref.MessageID] = true
-	delete(f.files, fmt.Sprintf("f%d", ref.MessageID-1000))
+	for _, rep := range ref.Replicas {
+		f.deleted[rep.Locator] = true
+		delete(f.files, rep.Locator)
+	}
 	return nil
 }
 
@@ -403,31 +417,29 @@ func TestPutObjectOverwriteReapsChunks(t *testing.T) {
 	r := newMPRig(t)
 	seedBucket(t, r)
 
-	// First PUT: 10 bytes -> 3 chunks (size 4, 4, 2) -> message IDs 1001..1003.
+	// First PUT: 10 bytes -> 3 chunks (size 4, 4, 2) -> 3 replica locators.
 	if rec := r.do(http.MethodPut, "/send/k", []byte("abcdefghij")); rec.Code != http.StatusOK {
 		t.Fatalf("put 1: %d %s", rec.Code, rec.Body)
 	}
 	r.be.mu.Lock()
-	firstMsgs := make([]int64, 0, len(r.be.files))
-	for fid := range r.be.files {
-		var n int64
-		fmt.Sscanf(fid, "f%d", &n)
-		firstMsgs = append(firstMsgs, 1000+n)
+	firstLocs := make([]string, 0, len(r.be.files))
+	for loc := range r.be.files {
+		firstLocs = append(firstLocs, loc)
 	}
 	r.be.mu.Unlock()
-	if len(firstMsgs) == 0 {
+	if len(firstLocs) == 0 {
 		t.Fatal("expected backend files after first PUT")
 	}
 
-	// Second PUT: different bytes -> different chunks. Old messages must go.
+	// Second PUT: different bytes -> different chunks. Old replicas must go.
 	if rec := r.do(http.MethodPut, "/send/k", []byte("xy")); rec.Code != http.StatusOK {
 		t.Fatalf("put 2: %d %s", rec.Code, rec.Body)
 	}
 	r.be.mu.Lock()
 	defer r.be.mu.Unlock()
-	for _, mid := range firstMsgs {
-		if !r.be.deleted[mid] {
-			t.Fatalf("first PUT's message %d was not reaped after overwrite", mid)
+	for _, loc := range firstLocs {
+		if !r.be.deleted[loc] {
+			t.Fatalf("first PUT's replica %s was not reaped after overwrite", loc)
 		}
 	}
 }
@@ -461,14 +473,12 @@ func TestCompleteMultipartOverwriteReapsChunks(t *testing.T) {
 		t.Fatalf("put 1: %d %s", rec.Code, rec.Body)
 	}
 	r.be.mu.Lock()
-	firstMsgs := make([]int64, 0, len(r.be.files))
-	for fid := range r.be.files {
-		var n int64
-		fmt.Sscanf(fid, "f%d", &n)
-		firstMsgs = append(firstMsgs, 1000+n)
+	firstLocs := make([]string, 0, len(r.be.files))
+	for loc := range r.be.files {
+		firstLocs = append(firstLocs, loc)
 	}
 	r.be.mu.Unlock()
-	if len(firstMsgs) == 0 {
+	if len(firstLocs) == 0 {
 		t.Fatal("expected backend files after first PUT")
 	}
 
@@ -487,9 +497,9 @@ func TestCompleteMultipartOverwriteReapsChunks(t *testing.T) {
 	}
 	r.be.mu.Lock()
 	defer r.be.mu.Unlock()
-	for _, mid := range firstMsgs {
-		if !r.be.deleted[mid] {
-			t.Fatalf("multipart complete did not reap prior message %d", mid)
+	for _, loc := range firstLocs {
+		if !r.be.deleted[loc] {
+			t.Fatalf("multipart complete did not reap prior replica %s", loc)
 		}
 	}
 }
@@ -506,7 +516,7 @@ type failingDeleteBackend struct {
 func (f *failingDeleteBackend) Delete(ctx context.Context, ref storage.ChunkRef) error {
 	if f.failNext {
 		f.failNext = false
-		return fmt.Errorf("simulated telegram delete failure for %d", ref.MessageID)
+		return fmt.Errorf("simulated delete failure for %s", refLocator(ref))
 	}
 	return f.Backend.Delete(ctx, ref)
 }

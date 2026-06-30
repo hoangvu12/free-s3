@@ -5,47 +5,46 @@ import (
 	"io"
 )
 
-// Chunk is one Telegram message holding a contiguous slice of an object.
-// An object is the ordered concatenation of its chunks (Seq 0..N).
-type Chunk struct {
-	Seq       int
-	FileID    string
-	MessageID int64
-	Size      int64
-	Offset    int64 // byte offset of this chunk's first byte within the object
-	Transport string
-	BotIndex  int
+// Replica is one stored copy of a chunk on a single free host. The backend
+// fetches a chunk by trying its replicas in order until one returns bytes, and
+// deletes a chunk by best-effort removing every replica.
+type Replica struct {
+	Provider    string // "ia", "fileditch", "catbox", "x0.at", ...
+	Locator     string // the direct download URL (or provider-native id we build a URL from)
+	DeleteToken string // 0x0 X-Token etc.; "" if the provider has no per-file delete token
 }
 
-// Transport identifier persisted on every chunk row. Kept as a column
-// + struct field for schema compatibility (additive-only invariant);
-// only one value is in use post-migration.
-const TransportMTProto = "mtproto"
+// Chunk = one contiguous slice of an object, replicated to R providers.
+// Returned by Backend.Upload, persisted by the handler via metadata.
+type Chunk struct {
+	Seq      int
+	Size     int64
+	Offset   int64     // byte offset of this chunk's first byte within the object
+	Replicas []Replica // len == R (or fewer if some uploads failed but >= 1 ok)
+}
 
-// ChunkRef is the transport-agnostic locator the Backend uses to fetch
-// or delete one Telegram message. MessageID + BotIndex are the
-// load-bearing fields under MTProto.
+// ChunkRef = locator to fetch or delete ONE chunk. It is the chunk's replica
+// list plus its size; the backend tries replicas in order (durable first) until
+// one returns bytes.
 type ChunkRef struct {
-	Transport string
-	BotFileID string
-	MessageID int64
-	BotIndex  int
+	Size     int64
+	Replicas []Replica
 }
 
 type Backend interface {
-	// Upload streams body, splitting it into Telegram messages each no larger
-	// than the backend's chunk size, and returns the ordered chunk list.
+	// Upload splits body into chunks (each <= the smallest selected provider
+	// cap), uploads each chunk to R distinct providers concurrently, and
+	// returns the ordered chunk list.
 	Upload(ctx context.Context, name, contentType string, body io.Reader) ([]Chunk, error)
-	// Download returns a reader over a single chunk's full content.
+	// Download returns a reader over one chunk's full content (first healthy replica).
 	Download(ctx context.Context, ref ChunkRef) (io.ReadCloser, error)
-	// DownloadRange returns [offset, offset+length) of a single chunk.
-	// length <= 0 means "to end of chunk".
+	// DownloadRange returns [offset, offset+length) of one chunk via an HTTP
+	// Range on a replica. length <= 0 means "to end of chunk".
 	DownloadRange(ctx context.Context, ref ChunkRef, offset, length int64) (io.ReadCloser, error)
-	// Delete removes a single Telegram message (hard delete of stored bytes).
+	// Delete best-effort removes every replica of one chunk.
 	Delete(ctx context.Context, ref ChunkRef) error
-	// DeleteBatch removes a batch of messages. MTProto batches at
-	// 100/call via ChannelsDeleteMessages. The error returned is the
-	// first one encountered; per-ref failures are logged by the backend
-	// so the caller can treat this as best-effort cleanup.
+	// DeleteBatch best-effort removes every replica of many chunks (per-ref
+	// failures are logged by the backend so the caller treats it as
+	// best-effort cleanup; the returned error is the first encountered).
 	DeleteBatch(ctx context.Context, refs []ChunkRef) error
 }

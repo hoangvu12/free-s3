@@ -113,7 +113,7 @@ func (h *Handler) uploadPart(ctx context.Context, w http.ResponseWriter, r *http
 			h.writeError(w, http.StatusBadRequest, "IncompleteBody", "The request body does not match the declared chunk framing.")
 			return
 		}
-		h.writeError(w, http.StatusBadGateway, "TelegramUploadFailed", err.Error())
+		h.writeError(w, http.StatusBadGateway, "FreeHostUploadFailed", err.Error())
 		return
 	}
 	size, ok := h.validateDecodedSize(w, r, body.n)
@@ -200,8 +200,7 @@ func (h *Handler) completeMultipartUpload(ctx context.Context, w http.ResponseWr
 		}
 		for _, c := range partChunks {
 			finalChunks = append(finalChunks, metadata.Chunk{
-				Seq: seq, FileID: c.FileID, MessageID: c.MessageID, Size: c.Size, Offset: totalSize,
-				Transport: c.Transport, BotIndex: c.BotIndex,
+				Seq: seq, Size: c.Size, Offset: totalSize, Replicas: c.Replicas,
 			})
 			seq++
 			totalSize += c.Size
@@ -213,22 +212,16 @@ func (h *Handler) completeMultipartUpload(ctx context.Context, w http.ResponseWr
 
 	obj := metadata.Object{Bucket: bucket, Key: key, Size: totalSize, ETag: objectETag, ContentType: u.ContentType}
 	obj.Metadata, _ = h.store.GetMultipartUploadMetadata(ctx, uploadID)
-	if len(finalChunks) > 0 {
-		obj.TelegramFileID = finalChunks[0].FileID
-		obj.TelegramMessageID = finalChunks[0].MessageID
-	}
 
-	// Same overwrite-reap pattern as putObject (8.5): capture the prior
-	// version BEFORE the finalize txn replaces it in object_chunks, reap
-	// AFTER the txn commits.
+	// Same overwrite-reap pattern as putObject: capture the prior version
+	// BEFORE the finalize txn replaces it in object_chunks, reap AFTER commit.
 	oldChunks, _ := h.store.GetObjectChunks(ctx, bucket, key)
-	prev, _ := h.store.GetObject(ctx, bucket, key)
 
 	if err := h.store.FinalizeMultipartUpload(ctx, obj, finalChunks, uploadID); err != nil {
 		h.writeError(w, http.StatusInternalServerError, "InternalError", err.Error())
 		return
 	}
-	h.reapSupersededChunks(ctx, oldChunks, prev)
+	h.reapSupersededChunks(ctx, oldChunks)
 
 	h.writeXML(w, http.StatusOK, completeMultipartUploadResult{
 		Location: "/" + bucket + "/" + key,

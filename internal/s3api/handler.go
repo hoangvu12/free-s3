@@ -248,7 +248,7 @@ func (h *Handler) putObject(ctx context.Context, w http.ResponseWriter, r *http.
 			h.writeError(w, http.StatusBadRequest, "IncompleteBody", "The request body does not match the declared chunk framing.")
 			return
 		}
-		h.writeError(w, http.StatusBadGateway, "TelegramUploadFailed", err.Error())
+		h.writeError(w, http.StatusBadGateway, "FreeHostUploadFailed", err.Error())
 		return
 	}
 
@@ -260,36 +260,27 @@ func (h *Handler) putObject(ctx context.Context, w http.ResponseWriter, r *http.
 
 	etag := hex.EncodeToString(hasher.Sum(nil))
 	obj := metadata.Object{Bucket: bucket, Key: key, Size: size, ETag: etag, ContentType: contentType, Metadata: captureObjectMetadata(r.Header)}
-	if len(chunks) > 0 {
-		// Keep the legacy columns non-NULL and pointing at the first chunk.
-		obj.TelegramFileID = chunks[0].FileID
-		obj.TelegramMessageID = chunks[0].MessageID
-	}
 
-	// Read the prior version's Telegram references BEFORE PutObject — the
-	// txn replaces object_chunks in place, so afterwards the old rows are
-	// gone (8.5, closes §6.1). prev is a legacy fallback: a pre-Phase-3
-	// row has no object_chunks but a non-zero TelegramMessageID.
+	// Read the prior version's chunk map BEFORE PutObject — the txn replaces
+	// object_chunks in place, so afterwards the old rows are gone. The reap
+	// (below) drops the superseded replicas from the free hosts.
 	oldChunks, _ := h.store.GetObjectChunks(ctx, bucket, key)
-	prev, _ := h.store.GetObject(ctx, bucket, key)
 
 	if err := h.store.PutObject(ctx, obj, toMetaChunks(chunks)); err != nil {
 		h.deleteChunks(ctx, chunks)
 		h.writeError(w, http.StatusInternalServerError, "InternalError", err.Error())
 		return
 	}
-	h.reapSupersededChunks(ctx, oldChunks, prev)
+	h.reapSupersededChunks(ctx, oldChunks)
 	w.Header().Set("ETag", quoteETag(etag))
 	w.WriteHeader(http.StatusOK)
 }
 
-// reapSupersededChunks best-effort drops the previous version's Telegram
-// messages after a successful overwrite. A failure here is logged but never
-// 5xx's the now-durable write — the new object is already authoritative.
-// Post Phase 3 the chunk map is authoritative for every non-empty object
-// (legacy single-message rows are backfilled at migration time), so the
-// pre-Phase-3 prev.TelegramMessageID fallback no longer fires.
-func (h *Handler) reapSupersededChunks(ctx context.Context, oldChunks []metadata.Chunk, _ metadata.Object) {
+// reapSupersededChunks best-effort drops the previous version's chunk replicas
+// from the free hosts after a successful overwrite. A failure here is logged
+// but never 5xx's the now-durable write — the new object is already
+// authoritative.
+func (h *Handler) reapSupersededChunks(ctx context.Context, oldChunks []metadata.Chunk) {
 	refs := chunkRefs(oldChunks)
 	if len(refs) == 0 {
 		return
@@ -330,12 +321,37 @@ func (h *Handler) validateDecodedSize(w http.ResponseWriter, r *http.Request, go
 	return got, true
 }
 
+// toMetaChunks converts the backend's upload result into the persistence
+// shape. Freshly uploaded replicas are alive by definition.
 func toMetaChunks(chunks []storage.Chunk) []metadata.Chunk {
 	mc := make([]metadata.Chunk, len(chunks))
 	for i, c := range chunks {
-		mc[i] = metadata.Chunk{Seq: c.Seq, FileID: c.FileID, MessageID: c.MessageID, Size: c.Size, Offset: c.Offset, Transport: c.Transport, BotIndex: c.BotIndex}
+		reps := make([]metadata.Replica, len(c.Replicas))
+		for j, r := range c.Replicas {
+			reps[j] = metadata.Replica{Provider: r.Provider, Locator: r.Locator, DeleteToken: r.DeleteToken, Alive: true}
+		}
+		mc[i] = metadata.Chunk{Seq: c.Seq, Size: c.Size, Offset: c.Offset, Replicas: reps}
 	}
 	return mc
+}
+
+// storageReplicas converts persisted replicas into the backend shape, listing
+// alive replicas first so reads try live copies before any the self-heal sweep
+// has flagged dead. Dead replicas are still included (last-ditch read /
+// best-effort delete target), just after the live ones.
+func storageReplicas(reps []metadata.Replica) []storage.Replica {
+	out := make([]storage.Replica, 0, len(reps))
+	for _, r := range reps { // alive first
+		if r.Alive {
+			out = append(out, storage.Replica{Provider: r.Provider, Locator: r.Locator, DeleteToken: r.DeleteToken})
+		}
+	}
+	for _, r := range reps { // then dead, as fallback
+		if !r.Alive {
+			out = append(out, storage.Replica{Provider: r.Provider, Locator: r.Locator, DeleteToken: r.DeleteToken})
+		}
+	}
+	return out
 }
 
 // chunkRefs converts a metadata.Chunk slice into the ChunkRef slice the
@@ -347,12 +363,12 @@ func chunkRefs(chunks []metadata.Chunk) []storage.ChunkRef {
 	}
 	refs := make([]storage.ChunkRef, len(chunks))
 	for i, c := range chunks {
-		refs[i] = storage.ChunkRef{Transport: c.Transport, BotFileID: c.FileID, MessageID: c.MessageID, BotIndex: c.BotIndex}
+		refs[i] = storage.ChunkRef{Size: c.Size, Replicas: storageReplicas(c.Replicas)}
 	}
 	return refs
 }
 
-// deleteChunks best-effort removes the Telegram messages for chunks that were
+// deleteChunks best-effort removes the free-host blobs for chunks that were
 // uploaded but whose object was then rejected/failed to persist.
 func (h *Handler) deleteChunks(ctx context.Context, chunks []storage.Chunk) {
 	refs := chunkRefs(toMetaChunks(chunks))
@@ -459,14 +475,14 @@ func (h *Handler) planRead(obj metadata.Object, chunks []metadata.Chunk, rng *ht
 
 // metaChunkRef builds a ChunkRef from a single metadata.Chunk row.
 func metaChunkRef(c metadata.Chunk) storage.ChunkRef {
-	return storage.ChunkRef{Transport: c.Transport, BotFileID: c.FileID, MessageID: c.MessageID, BotIndex: c.BotIndex}
+	return storage.ChunkRef{Size: c.Size, Replicas: storageReplicas(c.Replicas)}
 }
 
 // newPrefetchReader constructs a parallel-prefetch reader over the given
 // locs + range. The caller must Prime() before committing any HTTP
 // status line so a chunk-0 failure surfaces as 502 (not a truncated 200).
 func (h *Handler) newPrefetchReader(ctx context.Context, objSize int64, locs []reader.ChunkLoc, start, end int64) *reader.Reader {
-	src := reader.NewBotSource(h.backend, objSize, locs, h.cfg.StreamChunkSize)
+	src := reader.NewChunkSource(h.backend, objSize, locs, h.cfg.StreamChunkSize)
 	return reader.New(ctx, src, start, end,
 		h.cfg.StreamConcurrency, h.cfg.StreamBuffers, h.cfg.ChunkTimeout)
 }
@@ -504,7 +520,7 @@ func (h *Handler) streamObject(ctx context.Context, w http.ResponseWriter, obj m
 	pr := h.newPrefetchReader(ctx, obj.Size, locs, start, end)
 	defer pr.Close()
 	if err := pr.Prime(); err != nil && err != io.EOF {
-		h.writeError(w, http.StatusBadGateway, "TelegramDownloadFailed", err.Error())
+		h.writeError(w, http.StatusBadGateway, "FreeHostDownloadFailed", err.Error())
 		return
 	}
 	writeHeaders()

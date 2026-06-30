@@ -79,7 +79,7 @@ func (h *Handler) copyObject(ctx context.Context, w http.ResponseWriter, r *http
 
 	reader, err := h.openObject(ctx, src, srcChunks, nil)
 	if err != nil {
-		h.writeError(w, http.StatusBadGateway, "TelegramDownloadFailed", err.Error())
+		h.writeError(w, http.StatusBadGateway, "FreeHostDownloadFailed", err.Error())
 		return
 	}
 	defer reader.Close()
@@ -88,16 +88,12 @@ func (h *Handler) copyObject(ctx context.Context, w http.ResponseWriter, r *http
 	counter := &countingReader{r: io.TeeReader(reader, hasher)}
 	chunks, err := h.backend.Upload(ctx, dstKey, contentType, counter)
 	if err != nil {
-		h.writeError(w, http.StatusBadGateway, "TelegramUploadFailed", err.Error())
+		h.writeError(w, http.StatusBadGateway, "FreeHostUploadFailed", err.Error())
 		return
 	}
 	etag := hex.EncodeToString(hasher.Sum(nil))
 
 	obj := metadata.Object{Bucket: dstBucket, Key: dstKey, Size: counter.n, ETag: etag, ContentType: contentType, Metadata: meta}
-	if len(chunks) > 0 {
-		obj.TelegramFileID = chunks[0].FileID
-		obj.TelegramMessageID = chunks[0].MessageID
-	}
 	old, _ := h.store.GetObjectChunks(ctx, dstBucket, dstKey)
 	if err := h.store.PutObject(ctx, obj, toMetaChunks(chunks)); err != nil {
 		h.deleteChunks(ctx, chunks)
@@ -143,7 +139,7 @@ func (h *Handler) uploadPartCopy(ctx context.Context, w http.ResponseWriter, r *
 
 	reader, err := h.openObject(ctx, src, srcChunks, rng)
 	if err != nil {
-		h.writeError(w, http.StatusBadGateway, "TelegramDownloadFailed", err.Error())
+		h.writeError(w, http.StatusBadGateway, "FreeHostDownloadFailed", err.Error())
 		return
 	}
 	defer reader.Close()
@@ -152,7 +148,7 @@ func (h *Handler) uploadPartCopy(ctx context.Context, w http.ResponseWriter, r *
 	counter := &countingReader{r: io.TeeReader(reader, hasher)}
 	chunks, err := h.backend.Upload(ctx, u.Key, u.ContentType, counter)
 	if err != nil {
-		h.writeError(w, http.StatusBadGateway, "TelegramUploadFailed", err.Error())
+		h.writeError(w, http.StatusBadGateway, "FreeHostUploadFailed", err.Error())
 		return
 	}
 	partETag := hex.EncodeToString(hasher.Sum(nil))

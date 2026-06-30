@@ -315,19 +315,28 @@ func TestPrimeIsIdempotent(t *testing.T) {
 	}
 }
 
-// --- BotSource tests --------------------------------------------------------
+// --- ChunkSource tests --------------------------------------------------------
 
 // chunkBackend is a minimal storage.Backend that serves in-memory blobs
-// keyed by BotFileID. Only DownloadRange is exercised by BotSource, so
+// keyed by replica locator. Only DownloadRange is exercised by ChunkSource, so
 // the other methods are no-ops.
 type chunkBackend struct {
 	mu     sync.Mutex
 	blobs  map[string][]byte
 	calls  atomic.Int64
-	failOn string // BotFileID to fail with errFakeFail; "" disables
+	failOn string // locator to fail with errFakeFail; "" disables
 }
 
 var errFakeFail = errors.New("chunkBackend: synthetic failure")
+
+// refLoc returns a ref's first replica locator (the fake stores one replica
+// per chunk).
+func refLoc(ref storage.ChunkRef) string {
+	if len(ref.Replicas) == 0 {
+		return ""
+	}
+	return ref.Replicas[0].Locator
+}
 
 func (b *chunkBackend) Upload(context.Context, string, string, io.Reader) ([]storage.Chunk, error) {
 	return nil, nil
@@ -339,14 +348,14 @@ func (b *chunkBackend) Delete(context.Context, storage.ChunkRef) error          
 func (b *chunkBackend) DeleteBatch(context.Context, []storage.ChunkRef) error    { return nil }
 func (b *chunkBackend) DownloadRange(_ context.Context, ref storage.ChunkRef, off, length int64) (io.ReadCloser, error) {
 	b.calls.Add(1)
-	if ref.BotFileID == b.failOn {
+	if refLoc(ref) == b.failOn {
 		return nil, errFakeFail
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	data, ok := b.blobs[ref.BotFileID]
+	data, ok := b.blobs[refLoc(ref)]
 	if !ok {
-		return nil, fmt.Errorf("no such blob %s", ref.BotFileID)
+		return nil, fmt.Errorf("no such blob %s", refLoc(ref))
 	}
 	if off >= int64(len(data)) {
 		return io.NopCloser(bytes.NewReader(nil)), nil
@@ -362,9 +371,9 @@ func (b *chunkBackend) DownloadRange(_ context.Context, ref storage.ChunkRef, of
 // over [start, end).
 func buildBlob(start, end int64) []byte { return wantedBytes(start, end) }
 
-// TestBotSourceFullReadStraddlesMessages: a prefetch chunk larger than
+// TestChunkSourceFullReadStraddlesMessages: a prefetch chunk larger than
 // the upload messages should still stitch bytes together correctly.
-func TestBotSourceFullReadStraddlesMessages(t *testing.T) {
+func TestChunkSourceFullReadStraddlesMessages(t *testing.T) {
 	const total = 300
 	const uploadSize = 80     // upload chunks of 80 bytes
 	const prefetchCS = 128    // prefetch reads 128-byte windows
@@ -379,13 +388,13 @@ func TestBotSourceFullReadStraddlesMessages(t *testing.T) {
 		fid := fmt.Sprintf("file-%d", off)
 		be.blobs[fid] = buildBlob(off, end)
 		locs = append(locs, ChunkLoc{
-			Ref:    storage.ChunkRef{Transport: storage.TransportMTProto, BotFileID: fid},
+			Ref:    storage.ChunkRef{Replicas: []storage.Replica{{Locator: fid}}},
 			Offset: off,
 			Size:   end - off,
 		})
 	}
 
-	src := NewBotSource(be, total, locs, prefetchCS)
+	src := NewChunkSource(be, total, locs, prefetchCS)
 	r := New(context.Background(), src, 0, total, 2, 2, 0)
 	defer r.Close()
 	if err := r.Prime(); err != nil && err != io.EOF {
@@ -400,9 +409,9 @@ func TestBotSourceFullReadStraddlesMessages(t *testing.T) {
 	}
 }
 
-// TestBotSourceRangeAcrossMessages exercises an unaligned Range that
+// TestChunkSourceRangeAcrossMessages exercises an unaligned Range that
 // covers a partial slice of two adjacent upload messages.
-func TestBotSourceRangeAcrossMessages(t *testing.T) {
+func TestChunkSourceRangeAcrossMessages(t *testing.T) {
 	const total = 200
 	const uploadSize = 50
 	be := &chunkBackend{blobs: map[string][]byte{}}
@@ -411,14 +420,14 @@ func TestBotSourceRangeAcrossMessages(t *testing.T) {
 		fid := fmt.Sprintf("f-%d", off)
 		be.blobs[fid] = buildBlob(off, off+uploadSize)
 		locs = append(locs, ChunkLoc{
-			Ref:    storage.ChunkRef{Transport: storage.TransportMTProto, BotFileID: fid},
+			Ref:    storage.ChunkRef{Replicas: []storage.Replica{{Locator: fid}}},
 			Offset: off,
 			Size:   uploadSize,
 		})
 	}
 
 	// Read [40, 110): straddles upload chunks 0 (0-50), 1 (50-100), 2 (100-150).
-	src := NewBotSource(be, total, locs, 64)
+	src := NewChunkSource(be, total, locs, 64)
 	r := New(context.Background(), src, 40, 110, 2, 2, 0)
 	defer r.Close()
 	if err := r.Prime(); err != nil {
@@ -433,11 +442,11 @@ func TestBotSourceRangeAcrossMessages(t *testing.T) {
 	}
 }
 
-// TestBotSourceChunkSizeShrinksForTinyRanges: a small Range should not
+// TestChunkSourceChunkSizeShrinksForTinyRanges: a small Range should not
 // over-fetch the configured prefetch size.
-func TestBotSourceChunkSizeShrinksForTinyRanges(t *testing.T) {
+func TestChunkSourceChunkSizeShrinksForTinyRanges(t *testing.T) {
 	be := &chunkBackend{}
-	src := NewBotSource(be, 1<<30, nil, 4<<20) // 4 MiB nominal
+	src := NewChunkSource(be, 1<<30, nil, 4<<20) // 4 MiB nominal
 	if cs := src.ChunkSize(100, 200); cs > 64<<10 {
 		t.Fatalf("ChunkSize(span=100) = %d; want <= 64 KiB", cs)
 	}
