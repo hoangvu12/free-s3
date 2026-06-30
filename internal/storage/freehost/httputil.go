@@ -151,6 +151,38 @@ func (c *Client) uploadMultipart(ctx context.Context, url string, fields map[str
 	return outBody, outHdr, err
 }
 
+// sendBytes issues a raw-body request (PUT/POST) with retry and returns the
+// trimmed response body + headers of the first attempt that passes validate.
+// Used by hosts that take the file as the raw request body (IA PUT, buzzheavier
+// PUT, paste.c-net.org PUT, pixeldrain POST).
+func (c *Client) sendBytes(ctx context.Context, method, url string, data []byte, headers map[string]string, validate func(status int, body string) error) (string, http.Header, error) {
+	var outBody string
+	var outHdr http.Header
+	err := retry(ctx, func() error {
+		cctx, cancel := context.WithTimeout(ctx, defaultUploadTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(cctx, method, url, bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := c.do(req)
+		if err != nil {
+			return err
+		}
+		hdr := resp.Header
+		text := slurp(resp)
+		if verr := validate(resp.StatusCode, text); verr != nil {
+			return verr
+		}
+		outBody, outHdr = text, hdr
+		return nil
+	})
+	return outBody, outHdr, err
+}
+
 // postForm issues a urlencoded POST (single attempt; used for deletes, which are
 // best-effort) and returns the status + trimmed body.
 func (c *Client) postForm(ctx context.Context, endpoint string, values map[string]string) (int, string, error) {
@@ -165,6 +197,25 @@ func (c *Client) postForm(ctx context.Context, endpoint string, values map[strin
 		return 0, "", err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := c.do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	return resp.StatusCode, slurp(resp), nil
+}
+
+// deleteWithHeaders issues a DELETE (single attempt; deletes are best-effort)
+// with the given headers and returns the status + trimmed body.
+func (c *Client) deleteWithHeaders(ctx context.Context, url string, headers map[string]string) (int, string, error) {
+	cctx, cancel := context.WithTimeout(ctx, defaultUploadTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return 0, "", err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	resp, err := c.do(req)
 	if err != nil {
 		return 0, "", err

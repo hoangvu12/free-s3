@@ -73,4 +73,31 @@ func TestLiveCatbox(t *testing.T) {
 	liveRoundTrip(t, NewCatbox(NewClient(0), uh))
 }
 
-func TestLiveX0(t *testing.T) { liveRoundTrip(t, NewX0(NewClient(0))) }
+func TestLiveX0(t *testing.T)      { liveRoundTrip(t, NewX0(NewClient(0))) }
+func TestLiveEnvsSh(t *testing.T)  { liveRoundTrip(t, NewEnvsSh(NewClient(0))) }
+func TestLiveTtmSh(t *testing.T)   { liveRoundTrip(t, NewTtmSh(NewClient(0))) }
+func TestLiveFarsee(t *testing.T)  { liveRoundTrip(t, NewFarsee(NewClient(0))) }
+func TestLivePomf(t *testing.T)    { liveRoundTrip(t, NewPomfLainLa(NewClient(0))) }
+func TestLiveTempSh(t *testing.T)  { liveRoundTrip(t, NewTempSh(NewClient(0))) }
+func TestLivePaste(t *testing.T)   { liveRoundTrip(t, NewPasteCNet(NewClient(0))) }
+func TestLiveFilebin(t *testing.T) { liveRoundTrip(t, NewFilebin(NewClient(0))) }
+
+func TestLivePixeldrain(t *testing.T) {
+	liveRoundTrip(t, NewPixeldrain(NewClient(0), os.Getenv("PIXELDRAIN_API_KEY")))
+}
+
+func TestLiveIA(t *testing.T) {
+	ak, sk := os.Getenv("IA_ACCESS_KEY"), os.Getenv("IA_SECRET_KEY")
+	if ak == "" || sk == "" {
+		t.Skip("IA_ACCESS_KEY/IA_SECRET_KEY unset")
+	}
+	liveRoundTrip(t, NewIA(NewClient(0), ak, sk))
+}
+
+func TestLiveGofile(t *testing.T) {
+	tok := os.Getenv("GOFILE_TOKEN")
+	if tok == "" {
+		t.Skip("GOFILE_TOKEN unset — gofile needs a token for raw direct links")
+	}
+	liveRoundTrip(t, NewGofile(NewClient(0), tok))
+}

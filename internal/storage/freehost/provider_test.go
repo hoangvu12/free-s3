@@ -153,7 +153,7 @@ func TestX0UploadCapturesToken(t *testing.T) {
 	defer srv.Close()
 	srvURL = srv.URL
 
-	p := &X0{c: NewClient(0), host: srv.URL, name: "x0.at", maxByte: 1 << 30}
+	p := &zerox{c: NewClient(0), host: srv.URL, name: "x0.at", field: "file", maxByte: 1 << 30, durable: true, token: true}
 	loc, tok, err := p.Upload(context.Background(), []byte("payload"), "obj.2", "application/octet-stream")
 	if err != nil {
 		t.Fatalf("upload: %v", err)
@@ -211,4 +211,3 @@ func TestRangeGetEmulatesWhenServerIgnoresRange(t *testing.T) {
 		t.Fatalf("range emulated = %q, want 3456", got)
 	}
 }
-

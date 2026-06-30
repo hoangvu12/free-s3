@@ -7,28 +7,52 @@ import (
 	"strings"
 )
 
-// X0 — the 0x0-family host x0.at (1 GiB/file, 3-100 day retention, confirmed NOT
-// datacenter-blocked, unlike 0x0.st — RESEARCH.md). POST multipart field "file"
-// to the root; the response is the plaintext direct URL with an X-Token response
-// header used for deletion. Validated as a plaintext URL (not just HTTP 200).
-type X0 struct {
+// zerox is the generalized 0x0-family provider: POST a multipart file field to
+// the host root, get a plaintext direct URL back, with an optional X-Token
+// response header used for deletion (0x0 protocol: POST the file URL with
+// token=+delete=). Covers x0.at, envs.sh, ttm.sh (field "file", X-Token) and
+// fars.ee (field "c", UUID-managed, no X-Token).
+//
+// 0x0.st itself is intentionally absent: it refuses datacenter IPs (RESEARCH.md
+// gotcha #2). x0.at is the DC-friendly member.
+type zerox struct {
 	c       *Client
-	host    string // e.g. "https://x0.at"
 	name    string
+	host    string // e.g. https://x0.at
+	field   string // "file" or "c"
 	maxByte int64
+	durable bool
+	token   bool // host returns/accepts an X-Token delete token
 }
 
-func NewX0(c *Client) *X0 {
-	return &X0{c: c, host: "https://x0.at", name: "x0.at", maxByte: 1 << 30}
+// NewX0 is x0.at: 1 GiB, durable (in the BUILD-PLAN durable set), X-Token.
+func NewX0(c *Client) *zerox {
+	return &zerox{c: c, name: "x0.at", host: "https://x0.at", field: "file", maxByte: 1 << 30, durable: true, token: true}
 }
 
-func (p *X0) Name() string    { return p.name }
-func (p *X0) MaxBytes() int64 { return p.maxByte }
-func (p *X0) Durable() bool   { return true }
+// NewEnvsSh is envs.sh: 256 MiB, temp tier, X-Token.
+func NewEnvsSh(c *Client) *zerox {
+	return &zerox{c: c, name: "envs.sh", host: "https://envs.sh", field: "file", maxByte: 256 << 20, durable: false, token: true}
+}
 
-func (p *X0) Upload(ctx context.Context, data []byte, filename, contentType string) (string, string, error) {
+// NewTtmSh is ttm.sh: ~256 MiB, temp tier, X-Token.
+func NewTtmSh(c *Client) *zerox {
+	return &zerox{c: c, name: "ttm.sh", host: "https://ttm.sh", field: "file", maxByte: 256 << 20, durable: false, token: true}
+}
+
+// NewFarsee is fars.ee: large, no default expiry, field "c", UUID-managed (no
+// X-Token); we treat it as durable.
+func NewFarsee(c *Client) *zerox {
+	return &zerox{c: c, name: "fars.ee", host: "https://fars.ee", field: "c", maxByte: 1 << 30, durable: true, token: false}
+}
+
+func (p *zerox) Name() string    { return p.name }
+func (p *zerox) MaxBytes() int64 { return p.maxByte }
+func (p *zerox) Durable() bool   { return p.durable }
+
+func (p *zerox) Upload(ctx context.Context, data []byte, filename, contentType string) (string, string, error) {
 	var locator, token string
-	_, hdr, err := p.c.uploadMultipart(ctx, p.host+"/", nil, "file", binName(filename), contentType, data, nil,
+	_, hdr, err := p.c.uploadMultipart(ctx, p.host+"/", nil, p.field, binName(filename), contentType, data, nil,
 		func(status int, body string) error {
 			if status < 200 || status >= 300 || !strings.HasPrefix(body, p.host) {
 				return fmt.Errorf("%s: HTTP %d body=%s", p.name, status, body)
@@ -39,18 +63,18 @@ func (p *X0) Upload(ctx context.Context, data []byte, filename, contentType stri
 	if err != nil {
 		return "", "", err
 	}
-	if hdr != nil {
+	if p.token && hdr != nil {
 		token = hdr.Get("X-Token")
 	}
 	return locator, token, nil
 }
 
-func (p *X0) Download(ctx context.Context, locator string, offset, length int64) (io.ReadCloser, error) {
+func (p *zerox) Download(ctx context.Context, locator string, offset, length int64) (io.ReadCloser, error) {
 	return p.c.rangeGet(ctx, locator, offset, length, nil)
 }
 
-func (p *X0) Delete(ctx context.Context, locator, deleteToken string) error {
-	if deleteToken == "" {
+func (p *zerox) Delete(ctx context.Context, locator, deleteToken string) error {
+	if !p.token || deleteToken == "" {
 		return nil
 	}
 	status, body, err := p.c.postForm(ctx, locator, map[string]string{
