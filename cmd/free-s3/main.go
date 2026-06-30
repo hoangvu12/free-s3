@@ -47,11 +47,12 @@ func main() {
 		logger.Info("freehost provider enabled", "name", p.Name(), "durable", p.Durable(), "max_bytes", p.MaxBytes())
 	}
 	backend, err := freehost.New(freehost.Options{
-		Providers:         providers,
-		ChunkSize:         cfg.ChunkSize,
-		ReplicationFactor: cfg.ReplicationFactor,
-		UploadConcurrency: cfg.UploadConcurrency,
-		Logger:            logger,
+		Providers:          providers,
+		ChunkSize:          cfg.ChunkSize,
+		ReplicationFactor:  cfg.ReplicationFactor,
+		UploadConcurrency:  cfg.UploadConcurrency,
+		ReplicaReadTimeout: cfg.ReplicaReadTimeout,
+		Logger:             logger,
 	})
 	if err != nil {
 		logger.Error("init freehost backend", "error", err)

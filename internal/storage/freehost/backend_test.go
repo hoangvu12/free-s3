@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"free-s3/internal/storage"
 )
@@ -26,6 +27,13 @@ type fakeProvider struct {
 	deleted map[string]bool
 	uploads int
 	seq     int
+	stall   bool // when set, Download blocks until ctx is cancelled (simulates a throttled host)
+}
+
+func (f *fakeProvider) setStall(v bool) {
+	f.mu.Lock()
+	f.stall = v
+	f.mu.Unlock()
 }
 
 func newFakeProvider(name string, durable bool, max int64) *fakeProvider {
@@ -51,7 +59,14 @@ func (f *fakeProvider) Upload(_ context.Context, data []byte, filename, _ string
 	return loc, "tok-" + f.name, nil
 }
 
-func (f *fakeProvider) Download(_ context.Context, locator string, offset, length int64) (io.ReadCloser, error) {
+func (f *fakeProvider) Download(ctx context.Context, locator string, offset, length int64) (io.ReadCloser, error) {
+	f.mu.Lock()
+	stall := f.stall
+	f.mu.Unlock()
+	if stall {
+		<-ctx.Done() // block like a throttled host until the per-replica deadline cancels us
+		return nil, ctx.Err()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	b, ok := f.blobs[locator]
@@ -200,6 +215,80 @@ func TestBackendDownloadFailsOverDeadReplica(t *testing.T) {
 	rc.Close()
 	if string(got) != "payload-bytes" {
 		t.Fatalf("failover read = %q", got)
+	}
+}
+
+// TestDownloadRangeBytesFailsOverErroredLead: the lead replica 404s; the window
+// read must fail over to the next replica and return the right bytes.
+func TestDownloadRangeBytesFailsOverErroredLead(t *testing.T) {
+	p1 := newFakeProvider("x0.at", true, 1<<30)
+	p2 := newFakeProvider("fileditch", true, 1<<30)
+	b := newTestBackend(t, 2, 100, p1, p2)
+	chunks, err := b.Upload(context.Background(), "k", "ct", strings.NewReader("payload-bytes"))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	ref := refOf(chunks[0])
+
+	lead := ref.Replicas[0]
+	b.pool.get(lead.Provider).(*fakeProvider).Delete(context.Background(), lead.Locator, "")
+
+	got, err := b.DownloadRangeBytes(context.Background(), ref, 0, 0)
+	if err != nil {
+		t.Fatalf("DownloadRangeBytes after killing lead: %v", err)
+	}
+	if string(got) != "payload-bytes" {
+		t.Fatalf("failover read = %q, want %q", got, "payload-bytes")
+	}
+}
+
+// TestDownloadRangeBytesFailsOverStalledLead: the lead replica stalls (like a
+// throttled host); the per-replica deadline must abandon it and the next replica
+// must serve — proving the fix for the "slow lead hangs the whole GET" bug.
+func TestDownloadRangeBytesFailsOverStalledLead(t *testing.T) {
+	p1 := newFakeProvider("x0.at", true, 1<<30)
+	p2 := newFakeProvider("fileditch", true, 1<<30)
+	b := newTestBackend(t, 2, 100, p1, p2)
+	b.replicaRead = 50 * time.Millisecond // tight per-replica deadline for the test
+	chunks, err := b.Upload(context.Background(), "k", "ct", strings.NewReader("payload-bytes"))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	ref := refOf(chunks[0])
+
+	// Make the lead replica stall indefinitely; the window read must NOT hang —
+	// it should abandon the lead at replicaRead and serve from replica 1.
+	b.pool.get(ref.Replicas[0].Provider).(*fakeProvider).setStall(true)
+
+	start := time.Now()
+	got, err := b.DownloadRangeBytes(context.Background(), ref, 0, 0)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("DownloadRangeBytes with stalled lead: %v", err)
+	}
+	if string(got) != "payload-bytes" {
+		t.Fatalf("failover read = %q, want %q", got, "payload-bytes")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("failover took %v — per-replica deadline did not abandon the stalled lead", elapsed)
+	}
+}
+
+// TestDownloadRangeBytesPartialRange: offset/length must be honored on the
+// replica that serves.
+func TestDownloadRangeBytesPartialRange(t *testing.T) {
+	p1 := newFakeProvider("x0.at", true, 1<<30)
+	b := newTestBackend(t, 1, 100, p1)
+	chunks, err := b.Upload(context.Background(), "k", "ct", strings.NewReader("0123456789"))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	got, err := b.DownloadRangeBytes(context.Background(), refOf(chunks[0]), 3, 4)
+	if err != nil {
+		t.Fatalf("DownloadRangeBytes range: %v", err)
+	}
+	if string(got) != "3456" {
+		t.Fatalf("range read = %q, want %q", got, "3456")
 	}
 }
 

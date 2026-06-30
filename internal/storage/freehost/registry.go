@@ -28,17 +28,27 @@ type Credentials struct {
 // temp.sh and filebin.net initially served HTML on read; their adapters now do
 // the POST-to-download (temp.sh) / verified-cookie 302 (filebin) dance and pass.
 //
-// Ordering rationale: pixeldrain is the fastest clean direct link, so it leads;
-// fileditch is permanent/no-auth (landing-page scrape on read); IA is the
-// permanent anchor but ingests asynchronously (a just-uploaded file 404s
-// briefly), so it sits at 3 rather than 0 so fresh reads don't eat a failed IA
-// fetch first; catbox/litterbox work but are bandwidth-throttled, so they trail
-// as durable backups rather than primary read sources.
+// Ordering rationale (read-priority — replicas[0] is the lead the GET reader
+// tries first): the lead must be a host that serves FAST from the deploy's
+// datacenter IP. x0.at leads: it stores a direct link (no per-read scrape),
+// is DC-friendly/unthrottled, and for our <=80MB chunks retains ~a year.
+// fileditch (permanent, 100GB) is next but re-scrapes its landing page for a
+// signed link on every read (two round-trips), so it trails x0.at. pixeldrain —
+// the fastest from a RESIDENTIAL IP but throttled hard from a datacenter IP —
+// is demoted below both; it stays in the durable set as storage, just not the
+// preferred read source. IA is the permanent anchor but ingests asynchronously
+// (a just-uploaded file 404s briefly). catbox/litterbox are bandwidth-throttled,
+// so they trail as durable backups.
+//
+// NOTE: this is only a bias. pool.candidates() health-tiers + round-robin
+// rotates within a tier, so the stored replica order varies per upload; the real
+// guard against a slow lead is DownloadRangeBytes' per-replica failover (a slow
+// lead is abandoned within REPLICA_READ_TIMEOUT and the next replica serves).
 var defaultProviderOrder = []string{
-	"pixeldrain",   // durable, fast, clean direct link
-	"fileditch",    // durable, 100GB, no auth (landing-page scrape on read)
+	"x0.at",        // durable, DC-friendly, unthrottled, direct link (no scrape) — lead
+	"fileditch",    // durable, 100GB, permanent (landing-page scrape on read)
 	"ia",           // permanent anchor (if credentialed; ingestion delay on read)
-	"x0.at",        // durable, DC-friendly
+	"pixeldrain",   // durable, but throttled from a datacenter IP — storage, not lead
 	"catbox",       // durable but throttled (needs userhash from VPS)
 	"uguu",         // temp/overflow, fast
 	"tmpfiles.org", // temp/overflow

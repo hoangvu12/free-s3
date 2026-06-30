@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"time"
 
 	"free-s3/internal/storage"
 )
@@ -21,20 +22,22 @@ import (
 // chunk to R distinct providers, and reads chunks back from the first healthy
 // replica.
 type Backend struct {
-	pool       *pool
-	chunkSize  int64
-	replicas   int // R
-	uploadConc int
-	logger     *slog.Logger
+	pool        *pool
+	chunkSize   int64
+	replicas    int // R
+	uploadConc  int
+	replicaRead time.Duration // per-replica read deadline before failover (0 = no per-replica cap)
+	logger      *slog.Logger
 }
 
 // Options bundles Backend construction.
 type Options struct {
-	Providers         []Provider
-	ChunkSize         int64
-	ReplicationFactor int
-	UploadConcurrency int
-	Logger            *slog.Logger
+	Providers          []Provider
+	ChunkSize          int64
+	ReplicationFactor  int
+	UploadConcurrency  int
+	ReplicaReadTimeout time.Duration
+	Logger             *slog.Logger
 }
 
 var _ storage.Backend = (*Backend)(nil)
@@ -64,11 +67,12 @@ func New(opts Options) (*Backend, error) {
 		return nil, errors.New("freehost: at least one durable provider must be enabled")
 	}
 	return &Backend{
-		pool:       p,
-		chunkSize:  opts.ChunkSize,
-		replicas:   opts.ReplicationFactor,
-		uploadConc: opts.UploadConcurrency,
-		logger:     logger,
+		pool:        p,
+		chunkSize:   opts.ChunkSize,
+		replicas:    opts.ReplicationFactor,
+		uploadConc:  opts.UploadConcurrency,
+		replicaRead: opts.ReplicaReadTimeout,
+		logger:      logger,
 	}, nil
 }
 
@@ -140,13 +144,16 @@ func (b *Backend) uploadChunk(ctx context.Context, nameHash string, seq int, off
 			wg.Add(1)
 			go func(j int, prov Provider) {
 				defer wg.Done()
+				start := time.Now()
 				loc, tok, err := prov.Upload(ctx, data, filename, contentType)
+				elapsed := time.Since(start)
 				if err != nil {
 					b.pool.markFailed(prov.Name())
-					b.logger.Warn("freehost: chunk replica upload failed", "provider", prov.Name(), "seq", seq, "error", err)
+					b.logger.Warn("freehost: chunk replica upload failed", "provider", prov.Name(), "seq", seq, "bytes", size, "elapsed_ms", elapsed.Milliseconds(), "error", err)
 					return
 				}
 				b.pool.markHealthy(prov.Name())
+				b.logger.Info("freehost: chunk replica uploaded", "provider", prov.Name(), "seq", seq, "bytes", size, "elapsed_ms", elapsed.Milliseconds())
 				results[j] = result{rep: storage.Replica{Provider: prov.Name(), Locator: loc, DeleteToken: tok}, ok: true}
 			}(j, prov)
 		}
@@ -201,6 +208,68 @@ func (b *Backend) openReplica(ctx context.Context, ref storage.ChunkRef, offset,
 		lastErr = errors.New("freehost: chunk has no replicas")
 	}
 	return nil, fmt.Errorf("freehost: all replicas failed: %w", lastErr)
+}
+
+// DownloadRangeBytes reads [offset, offset+length) of one chunk into memory,
+// trying each replica in order under a per-replica deadline and failing over to
+// the next replica on error/timeout. length <= 0 means "to end of chunk". This
+// is the hot read path's window fetch: because each window is bounded (the
+// reader's prefetch size, e.g. 4 MiB) buffering it is cheap, and the per-replica
+// deadline means a slow/throttled lead host (pixeldrain from a datacenter IP,
+// catbox's bandwidth cap, IA's ingestion lag) is abandoned in seconds and the
+// next replica serves — instead of the whole stream stalling on replica[0] until
+// the caller's window timeout cancels it mid-copy (the old behavior, which had
+// no failover). Read slowness is logged but does NOT mutate pool health, which
+// is fed by upload outcomes + the keepalive Verify sweep.
+func (b *Backend) DownloadRangeBytes(ctx context.Context, ref storage.ChunkRef, offset, length int64) ([]byte, error) {
+	var lastErr error
+	for _, rep := range ref.Replicas {
+		prov := b.pool.get(rep.Provider)
+		if prov == nil {
+			lastErr = fmt.Errorf("freehost: provider %q not enabled", rep.Provider)
+			continue
+		}
+		rctx := ctx
+		var cancel context.CancelFunc
+		if b.replicaRead > 0 {
+			rctx, cancel = context.WithTimeout(ctx, b.replicaRead)
+		}
+		start := time.Now()
+		buf, err := readReplicaBytes(rctx, prov, rep.Locator, offset, length)
+		elapsed := time.Since(start)
+		if cancel != nil {
+			cancel()
+		}
+		if err != nil {
+			lastErr = err
+			b.logger.Warn("freehost: replica range read failed, failing over",
+				"provider", rep.Provider, "offset", offset, "want", length,
+				"got", len(buf), "elapsed_ms", elapsed.Milliseconds(), "error", err)
+			continue
+		}
+		b.logger.Debug("freehost: replica range read ok",
+			"provider", rep.Provider, "offset", offset, "bytes", len(buf), "elapsed_ms", elapsed.Milliseconds())
+		return buf, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("freehost: chunk has no replicas")
+	}
+	return nil, fmt.Errorf("freehost: all replicas failed: %w", lastErr)
+}
+
+// readReplicaBytes opens one replica's range and reads it fully into memory,
+// respecting ctx's deadline. length <= 0 reads to EOF.
+func readReplicaBytes(ctx context.Context, prov Provider, locator string, offset, length int64) ([]byte, error) {
+	rc, err := prov.Download(ctx, locator, offset, length)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	var rdr io.Reader = rc
+	if length > 0 {
+		rdr = io.LimitReader(rc, length)
+	}
+	return io.ReadAll(rdr)
 }
 
 // Delete best-effort removes every replica of one chunk. The first error is

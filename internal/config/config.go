@@ -38,6 +38,13 @@ type Config struct {
 	StreamBuffers     int
 	ChunkTimeout      time.Duration
 	StreamChunkSize   int64
+	// ReplicaReadTimeout bounds a single replica's attempt to serve one
+	// prefetch window. When it fires the read fails over to the next replica
+	// (within the same ChunkTimeout budget) instead of stalling the whole
+	// stream — this is what keeps a slow/throttled lead host (e.g. pixeldrain
+	// from a datacenter IP) from hanging a GET. Keep it < ChunkTimeout / R so
+	// every replica gets a turn before the window's overall deadline.
+	ReplicaReadTimeout time.Duration
 
 	// --- freehost backend knobs ----------------------------------------
 	// ReplicationFactor (R) is the number of distinct providers each chunk is
@@ -76,6 +83,7 @@ func Load() (Config, error) {
 		StreamBuffers:           getInt("STREAM_BUFFERS", 8),
 		ChunkTimeout:            getDuration("CHUNK_TIMEOUT", 60*time.Second),
 		StreamChunkSize:         getBytes("STREAM_CHUNK_SIZE", 4<<20),
+		ReplicaReadTimeout:      getDuration("REPLICA_READ_TIMEOUT", 18*time.Second),
 		ReplicationFactor:       getInt("REPLICATION_FACTOR", 3),
 		ChunkSize:               getBytes("CHUNK_SIZE", 80<<20),
 		FreehostProviders:       parseCSVList(os.Getenv("FREEHOST_PROVIDERS")),

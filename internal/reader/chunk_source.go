@@ -35,6 +35,16 @@ type backendSource struct {
 	chunkSize int64 // configured prefetch chunk size (object-space); halved for tiny ranges
 }
 
+// rangeFailoverReader is the optional richer read path a Backend may implement:
+// a window fetch that tries each replica under a per-replica deadline and fails
+// over, returning the bytes directly. When present we prefer it over the plain
+// DownloadRange (which commits to the first replica that *opens* and cannot
+// recover if that replica then serves slowly). The freehost Backend implements
+// it; test fakes that don't simply fall back to DownloadRange.
+type rangeFailoverReader interface {
+	DownloadRangeBytes(ctx context.Context, ref storage.ChunkRef, offset, length int64) ([]byte, error)
+}
+
 // NewChunkSource constructs a source over the given chunk map. objSize is
 // the total object size; locs must be sorted by Offset and cover the
 // whole object (object_chunks rows). chunkSize is the prefetch window
@@ -84,14 +94,27 @@ func (s *backendSource) Chunk(ctx context.Context, offset, limit int64) ([]byte,
 			readEnd = end
 		}
 		want := readEnd - cur
-		rc, err := s.backend.DownloadRange(ctx, loc.Ref, localOff, want)
-		if err != nil {
-			return nil, err
-		}
-		n, err := io.Copy(byteSliceWriter{&out}, io.LimitReader(rc, want))
-		rc.Close()
-		if err != nil {
-			return nil, err
+		var n int64
+		if fo, ok := s.backend.(rangeFailoverReader); ok {
+			// Preferred path: per-replica failover under a tight deadline so a
+			// slow lead replica is abandoned for the next one within this same
+			// window, instead of stalling the whole stream.
+			buf, err := fo.DownloadRangeBytes(ctx, loc.Ref, localOff, want)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, buf...)
+			n = int64(len(buf))
+		} else {
+			rc, err := s.backend.DownloadRange(ctx, loc.Ref, localOff, want)
+			if err != nil {
+				return nil, err
+			}
+			n, err = io.Copy(byteSliceWriter{&out}, io.LimitReader(rc, want))
+			rc.Close()
+			if err != nil {
+				return nil, err
+			}
 		}
 		cur += n
 		if n == 0 || n < want {
