@@ -2,7 +2,7 @@
 *.db
 *.db-*
 *.log
-/telegram-s3
-/telegram-s3.exe
+/free-s3
+/free-s3.exe
 dist/
 tmp/

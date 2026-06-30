@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"strings"
 	"time"
 
@@ -33,15 +32,13 @@ type Bucket struct {
 }
 
 type Object struct {
-	Bucket            string
-	Key               string
-	Size              int64
-	ETag              string
-	ContentType       string
-	TelegramFileID    string // legacy single-message objects only; chunked objects use object_chunks
-	TelegramMessageID int64  // (kept for backward compat with pre-Phase-3 rows)
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	Bucket      string
+	Key         string
+	Size        int64
+	ETag        string
+	ContentType string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 	// Metadata is the optional side-table content (content-disposition,
 	// content-encoding, cache-control, expires, x-amz-meta-*) — write-only
 	// input to PutObject/FinalizeMultipartUpload. Reads use GetObjectMetadata
@@ -49,20 +46,25 @@ type Object struct {
 	Metadata map[string]string
 }
 
+// Replica is one stored copy of a chunk on a single free host. A chunk has R
+// replicas (one row per provider). Alive is the self-heal liveness flag: a
+// read that finds a replica 404/410 marks it dead (0) so future reads skip it
+// and the keep-alive sweep can refill R.
+type Replica struct {
+	Provider    string
+	Locator     string // direct download URL (or provider-native id we build a URL from)
+	DeleteToken string // 0x0 X-Token / "" if the provider has no per-file delete token
+	Alive       bool
+}
+
 // Chunk mirrors storage.Chunk for persistence (the layers stay decoupled; the
-// handler converts between them, as it already does for Object).
-//
-// Transport and BotIndex are persisted on the chunk row; the column
-// is retained for schema compatibility but only one value is in use
-// post-migration.
+// handler converts between them, as it already does for Object). A chunk is one
+// contiguous slice of an object, replicated to R providers.
 type Chunk struct {
-	Seq       int
-	FileID    string
-	MessageID int64
-	Size      int64
-	Offset    int64
-	Transport string
-	BotIndex  int
+	Seq      int
+	Size     int64
+	Offset   int64
+	Replicas []Replica
 }
 
 // Open opens the metadata store with the default reader-pool size (8). Use
@@ -79,8 +81,8 @@ func OpenWithOptions(path string, readerConns int) (*Store, error) {
 		readerConns = 8
 	}
 	// WAL + a busy timeout make the single-file DB resilient to the extra
-	// write pressure from chunk maps / multipart (S3-COMPAT-PLAN.md §6.4).
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	// write pressure from chunk maps / multipart.
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"
 
 	write, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -114,10 +116,11 @@ func (s *Store) Close() error {
 	return rerr
 }
 
+// migrate creates the free-s3 schema. We start with no legacy data (the fork
+// drops every Telegram-era table and the additive backfill), so the schema is
+// authored cleanly: a generic chunk table plus a per-replica side-table.
 func (s *Store) migrate() error {
-	// Additive only: the existing buckets/objects schema is untouched so live
-	// production rows (legacy single-message objects) keep working.
-	if _, err := s.write.Exec(`
+	_, err := s.write.Exec(`
 CREATE TABLE IF NOT EXISTS buckets (
   name TEXT PRIMARY KEY,
   created_at TEXT NOT NULL
@@ -129,8 +132,6 @@ CREATE TABLE IF NOT EXISTS objects (
   size INTEGER NOT NULL,
   etag TEXT NOT NULL,
   content_type TEXT NOT NULL,
-  telegram_file_id TEXT NOT NULL,
-  telegram_message_id INTEGER NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   deleted_at TEXT,
@@ -144,14 +145,28 @@ CREATE TABLE IF NOT EXISTS object_chunks (
   bucket TEXT NOT NULL,
   key TEXT NOT NULL,
   part_seq INTEGER NOT NULL,
-  telegram_file_id TEXT NOT NULL,
-  telegram_message_id INTEGER NOT NULL,
   size INTEGER NOT NULL,
   offset INTEGER NOT NULL,
   PRIMARY KEY (bucket, key, part_seq)
 );
 
 CREATE INDEX IF NOT EXISTS idx_object_chunks_key ON object_chunks(bucket, key, part_seq);
+
+-- One row per (chunk, replica). alive is flipped to 0 by self-heal when a
+-- read finds the replica gone; the keep-alive sweep refills R from a survivor.
+CREATE TABLE IF NOT EXISTS chunk_replicas (
+  bucket TEXT NOT NULL,
+  key TEXT NOT NULL,
+  part_seq INTEGER NOT NULL,
+  replica_idx INTEGER NOT NULL,
+  provider TEXT NOT NULL,
+  locator TEXT NOT NULL,
+  delete_token TEXT NOT NULL DEFAULT '',
+  alive INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (bucket, key, part_seq, replica_idx)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunk_replicas_key ON chunk_replicas(bucket, key, part_seq);
 
 CREATE TABLE IF NOT EXISTS multipart_uploads (
   upload_id TEXT PRIMARY KEY,
@@ -173,10 +188,19 @@ CREATE TABLE IF NOT EXISTS multipart_part_chunks (
   upload_id TEXT NOT NULL,
   part_number INTEGER NOT NULL,
   seq INTEGER NOT NULL,
-  telegram_file_id TEXT NOT NULL,
-  telegram_message_id INTEGER NOT NULL,
   size INTEGER NOT NULL,
   PRIMARY KEY (upload_id, part_number, seq)
+);
+
+CREATE TABLE IF NOT EXISTS multipart_part_chunk_replicas (
+  upload_id TEXT NOT NULL,
+  part_number INTEGER NOT NULL,
+  seq INTEGER NOT NULL,
+  replica_idx INTEGER NOT NULL,
+  provider TEXT NOT NULL,
+  locator TEXT NOT NULL,
+  delete_token TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (upload_id, part_number, seq, replica_idx)
 );
 
 CREATE TABLE IF NOT EXISTS object_metadata (
@@ -193,142 +217,8 @@ CREATE TABLE IF NOT EXISTS multipart_upload_metadata (
   value TEXT NOT NULL,
   PRIMARY KEY (upload_id, name)
 );
-
--- Phase 4: gotd MTProto session blobs, one row per bot. Partial writes
--- would force the bot to re-auth (auth.importBotAuthorization) and trip
--- flood control, so the session.Storage adapter upserts inside a tx.
-CREATE TABLE IF NOT EXISTS tg_sessions (
-  key TEXT PRIMARY KEY,
-  value BLOB NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
--- Phase 4 sweeper grace-delete buffer. The migration sweeper was
--- removed in Phase 5; the table is retained (additive-only schema
--- invariant) and holds dormant zombie rows from the original drain.
--- No code path reads or writes it now.
-CREATE TABLE IF NOT EXISTS bot_chunks_pending_delete (
-  message_id INTEGER NOT NULL,
-  bot_index INTEGER NOT NULL,
-  swapped_at TEXT NOT NULL,
-  PRIMARY KEY (message_id, bot_index)
-);
-CREATE INDEX IF NOT EXISTS idx_bot_chunks_pending_delete_swapped_at ON bot_chunks_pending_delete(swapped_at);
-`); err != nil {
-		return err
-	}
-
-	// Phase 3 additive columns. SQLite doesn't support `ADD COLUMN IF NOT
-	// EXISTS`, so ensureColumn probes pragma_table_info first and only
-	// issues the ALTER when missing. NOT NULL DEFAULT is safe with ALTER
-	// TABLE since SQLite materializes the default for existing rows.
-	for _, c := range []struct {
-		table, col, typ, def string
-	}{
-		{"object_chunks", "transport", "TEXT NOT NULL", "'bot'"},
-		{"object_chunks", "bot_index", "INTEGER NOT NULL", "0"},
-		{"multipart_part_chunks", "transport", "TEXT NOT NULL", "'bot'"},
-		{"multipart_part_chunks", "bot_index", "INTEGER NOT NULL", "0"},
-		{"objects", "transport", "TEXT NOT NULL", "'bot'"},
-		{"objects", "bot_index", "INTEGER NOT NULL", "0"},
-	} {
-		if err := s.ensureColumn(c.table, c.col, c.typ, c.def); err != nil {
-			return err
-		}
-	}
-
-	// One-shot backfill: legacy single-message objects (size > 0, no row in
-	// object_chunks) collapse to a one-row chunk so every read path can
-	// consume object_chunks uniformly — the three pre-Phase-3 fallback
-	// branches in handler.go are deleted in this phase. Idempotent: the
-	// EXISTS clause skips already-backfilled rows on subsequent boots.
-	return s.backfillLegacyChunks()
-}
-
-// ensureColumn issues ALTER TABLE ADD COLUMN if the column is missing.
-// SQLite has no `ADD COLUMN IF NOT EXISTS`, so we probe pragma_table_info
-// first; the helper is the single place ALTER lives so future additive
-// migrations follow the same pattern.
-func (s *Store) ensureColumn(table, col, typ, defaultExpr string) error {
-	rows, err := s.write.Query(`SELECT name FROM pragma_table_info(?)`, table)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return err
-		}
-		if name == col {
-			return nil
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	// Identifiers come from the caller (this file), not user input — so the
-	// fmt.Sprintf is safe. SQL injection would require attacker control of
-	// `table`/`col`, which is impossible.
-	stmt := fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s DEFAULT %s`, table, col, typ, defaultExpr)
-	_, err = s.write.Exec(stmt)
-	return err
-}
-
-// backfillLegacyChunks turns every pre-Phase-3 single-message object into
-// a one-row object_chunks entry so the read/delete code paths can drop
-// their legacy fallbacks. Empty objects (size == 0) never had a Telegram
-// message and stay chunkless. Re-running is a no-op: the NOT EXISTS clause
-// filters out rows that already have chunks (the normal Phase-2+ shape).
-func (s *Store) backfillLegacyChunks() error {
-	tx, err := s.write.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	rows, err := tx.Query(`
-SELECT bucket, key, size, telegram_file_id, telegram_message_id
-FROM objects
-WHERE size > 0
-  AND telegram_message_id != 0
-  AND deleted_at IS NULL
-  AND NOT EXISTS (
-    SELECT 1 FROM object_chunks oc
-    WHERE oc.bucket = objects.bucket AND oc.key = objects.key
-  )
 `)
-	if err != nil {
-		return err
-	}
-	type legacyRow struct {
-		bucket, key, fileID string
-		size, messageID     int64
-	}
-	var legacies []legacyRow
-	for rows.Next() {
-		var r legacyRow
-		if err := rows.Scan(&r.bucket, &r.key, &r.size, &r.fileID, &r.messageID); err != nil {
-			rows.Close()
-			return err
-		}
-		legacies = append(legacies, r)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
-
-	for _, r := range legacies {
-		if _, err := tx.Exec(`
-INSERT INTO object_chunks(bucket, key, part_seq, telegram_file_id, telegram_message_id, size, offset, transport, bot_index)
-VALUES(?, ?, 0, ?, ?, ?, 0, 'bot', 0)
-`, r.bucket, r.key, r.fileID, r.messageID, r.size); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
+	return err
 }
 
 func (s *Store) CreateBucket(ctx context.Context, name string) error {
@@ -377,9 +267,10 @@ func (s *Store) ListBuckets(ctx context.Context) ([]Bucket, error) {
 	return buckets, rows.Err()
 }
 
-// PutObject writes the object row and replaces its chunk map atomically. An
-// overwrite drops the prior chunk rows; the caller is responsible for deleting
-// the superseded Telegram messages (it holds the backend).
+// PutObject writes the object row and replaces its chunk map (chunks + replicas)
+// atomically. An overwrite drops the prior chunk/replica rows; the caller is
+// responsible for deleting the superseded blobs on the free hosts (it holds the
+// backend).
 func (s *Store) PutObject(ctx context.Context, obj Object, chunks []Chunk) error {
 	now := time.Now().UTC()
 	if obj.CreatedAt.IsZero() {
@@ -406,9 +297,9 @@ func (s *Store) PutObject(ctx context.Context, obj Object, chunks []Chunk) error
 }
 
 // replaceObjectMetadata side-table mirrors the object_chunks replace pattern:
-// the rows are wiped and re-inserted inside the object's own transaction, so a
-// legacy object simply has no rows (→ defaults) and an overwrite never leaves
-// stale metadata.
+// the rows are wiped and re-inserted inside the object's own transaction, so an
+// object stored without metadata simply has no rows and an overwrite never
+// leaves stale metadata.
 func replaceObjectMetadataTx(ctx context.Context, tx *sql.Tx, bucket, key string, kv map[string]string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM object_metadata WHERE bucket = ? AND key = ?`, bucket, key); err != nil {
 		return err
@@ -421,8 +312,8 @@ func replaceObjectMetadataTx(ctx context.Context, tx *sql.Tx, bucket, key string
 	return nil
 }
 
-// GetObjectMetadata returns the object's side-table metadata (empty for legacy
-// rows / objects stored without any).
+// GetObjectMetadata returns the object's side-table metadata (empty for objects
+// stored without any).
 func (s *Store) GetObjectMetadata(ctx context.Context, bucket, key string) (map[string]string, error) {
 	rows, err := s.read.QueryContext(ctx, `SELECT name, value FROM object_metadata WHERE bucket = ? AND key = ?`, bucket, key)
 	if err != nil {
@@ -444,10 +335,10 @@ func (s *Store) GetObject(ctx context.Context, bucket, key string) (Object, erro
 	var obj Object
 	var created, updated string
 	err := s.read.QueryRowContext(ctx, `
-SELECT bucket, key, size, etag, content_type, telegram_file_id, telegram_message_id, created_at, updated_at
+SELECT bucket, key, size, etag, content_type, created_at, updated_at
 FROM objects
 WHERE bucket = ? AND key = ? AND deleted_at IS NULL
-`, bucket, key).Scan(&obj.Bucket, &obj.Key, &obj.Size, &obj.ETag, &obj.ContentType, &obj.TelegramFileID, &obj.TelegramMessageID, &created, &updated)
+`, bucket, key).Scan(&obj.Bucket, &obj.Key, &obj.Size, &obj.ETag, &obj.ContentType, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Object{}, ErrNotFound
 	}
@@ -459,12 +350,11 @@ WHERE bucket = ? AND key = ? AND deleted_at IS NULL
 	return obj, nil
 }
 
-// GetObjectChunks returns the ordered chunk map. Post-Phase-3 every
-// non-empty object has at least one row here (legacy single-message
-// objects are backfilled at migration time); empty objects return nil.
+// GetObjectChunks returns the ordered chunk map, each chunk carrying its full
+// replica list (ordered by replica_idx). Empty objects return nil.
 func (s *Store) GetObjectChunks(ctx context.Context, bucket, key string) ([]Chunk, error) {
 	rows, err := s.read.QueryContext(ctx, `
-SELECT part_seq, telegram_file_id, telegram_message_id, size, offset, transport, bot_index
+SELECT part_seq, size, offset
 FROM object_chunks
 WHERE bucket = ? AND key = ?
 ORDER BY part_seq
@@ -475,19 +365,50 @@ ORDER BY part_seq
 	defer rows.Close()
 
 	var chunks []Chunk
+	idxBySeq := map[int]int{}
 	for rows.Next() {
 		var c Chunk
-		if err := rows.Scan(&c.Seq, &c.FileID, &c.MessageID, &c.Size, &c.Offset, &c.Transport, &c.BotIndex); err != nil {
+		if err := rows.Scan(&c.Seq, &c.Size, &c.Offset); err != nil {
 			return nil, err
 		}
+		idxBySeq[c.Seq] = len(chunks)
 		chunks = append(chunks, c)
 	}
-	return chunks, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(chunks) == 0 {
+		return nil, nil
+	}
+
+	rrows, err := s.read.QueryContext(ctx, `
+SELECT part_seq, provider, locator, delete_token, alive
+FROM chunk_replicas
+WHERE bucket = ? AND key = ?
+ORDER BY part_seq, replica_idx
+`, bucket, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rrows.Close()
+	for rrows.Next() {
+		var seq int
+		var r Replica
+		var alive int
+		if err := rrows.Scan(&seq, &r.Provider, &r.Locator, &r.DeleteToken, &alive); err != nil {
+			return nil, err
+		}
+		r.Alive = alive != 0
+		if ci, ok := idxBySeq[seq]; ok {
+			chunks[ci].Replicas = append(chunks[ci].Replicas, r)
+		}
+	}
+	return chunks, rrows.Err()
 }
 
-// DeleteObject hard-deletes the object and its chunk map. Telegram message
-// removal is the caller's responsibility (done before this, while the chunk
-// list is still readable).
+// DeleteObject hard-deletes the object, its chunk map, and replica rows. The
+// free-host blob removal is the caller's responsibility (done before this,
+// while the chunk/replica list is still readable).
 func (s *Store) DeleteObject(ctx context.Context, bucket, key string) error {
 	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
@@ -495,16 +416,25 @@ func (s *Store) DeleteObject(ctx context.Context, bucket, key string) error {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM object_chunks WHERE bucket = ? AND key = ?`, bucket, key); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM object_metadata WHERE bucket = ? AND key = ?`, bucket, key); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM objects WHERE bucket = ? AND key = ?`, bucket, key); err != nil {
-		return err
+	for _, q := range []string{
+		`DELETE FROM chunk_replicas WHERE bucket = ? AND key = ?`,
+		`DELETE FROM object_chunks WHERE bucket = ? AND key = ?`,
+		`DELETE FROM object_metadata WHERE bucket = ? AND key = ?`,
+		`DELETE FROM objects WHERE bucket = ? AND key = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, bucket, key); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
+}
+
+// MarkReplicaDead flips a replica's alive flag to 0 (self-heal read path). A
+// missing row is not an error — the replica may already have been pruned.
+func (s *Store) MarkReplicaDead(ctx context.Context, bucket, key string, partSeq, replicaIdx int) error {
+	_, err := s.write.ExecContext(ctx, `UPDATE chunk_replicas SET alive = 0 WHERE bucket = ? AND key = ? AND part_seq = ? AND replica_idx = ?`,
+		bucket, key, partSeq, replicaIdx)
+	return err
 }
 
 // ListParams drives a single ListObjects / ListObjectsV2 page.
@@ -539,7 +469,7 @@ func (s *Store) ListObjectsPage(ctx context.Context, p ListParams) (ListPage, er
 		maxKeys = 1000
 	}
 
-	query := `SELECT bucket, key, size, etag, content_type, telegram_file_id, telegram_message_id, created_at, updated_at
+	query := `SELECT bucket, key, size, etag, content_type, created_at, updated_at
 FROM objects WHERE bucket = ? AND deleted_at IS NULL`
 	args := []any{p.Bucket}
 	if p.After != "" {
@@ -568,7 +498,7 @@ FROM objects WHERE bucket = ? AND deleted_at IS NULL`
 	for rows.Next() {
 		var obj Object
 		var created, updated string
-		if err := rows.Scan(&obj.Bucket, &obj.Key, &obj.Size, &obj.ETag, &obj.ContentType, &obj.TelegramFileID, &obj.TelegramMessageID, &created, &updated); err != nil {
+		if err := rows.Scan(&obj.Bucket, &obj.Key, &obj.Size, &obj.ETag, &obj.ContentType, &created, &updated); err != nil {
 			return ListPage{}, err
 		}
 		obj.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
@@ -623,7 +553,7 @@ func prefixUpperBound(prefix string) string {
 	return ""
 }
 
-// --- Multipart upload (Phase 4) --------------------------------------------
+// --- Multipart upload ------------------------------------------------------
 
 type MultipartUpload struct {
 	UploadID    string
@@ -661,9 +591,7 @@ func (s *Store) GetMultipartUpload(ctx context.Context, uploadID string) (Multip
 }
 
 // ListMultipartUploads returns every in-progress upload in a bucket, ordered
-// by key then upload_id (the order S3's ListMultipartUploads reports). The
-// gateway does not paginate this — abandoned uploads are bounded in practice
-// and there is no lifecycle janitor yet (see progress §6.2).
+// by key then upload_id (the order S3's ListMultipartUploads reports).
 func (s *Store) ListMultipartUploads(ctx context.Context, bucket string) ([]MultipartUpload, error) {
 	rows, err := s.read.QueryContext(ctx, `SELECT upload_id, bucket, key, content_type, created_at FROM multipart_uploads WHERE bucket = ? ORDER BY key, upload_id`, bucket)
 	if err != nil {
@@ -685,16 +613,16 @@ func (s *Store) ListMultipartUploads(ctx context.Context, bucket string) ([]Mult
 
 // SetMultipartCreatedAt overrides a multipart upload's created_at timestamp.
 // Production never edits created_at after CreateMultipartUpload; this exists
-// only so the P8.6 janitor tests can stage a "stale" upload without sleeping
-// for the real TTL.
+// only so the janitor tests can stage a "stale" upload without sleeping for the
+// real TTL.
 func (s *Store) SetMultipartCreatedAt(ctx context.Context, uploadID string, t time.Time) error {
 	_, err := s.write.ExecContext(ctx, `UPDATE multipart_uploads SET created_at = ? WHERE upload_id = ?`, t.UTC().Format(time.RFC3339Nano), uploadID)
 	return err
 }
 
 // StaleMultipartUploads returns every multipart upload whose created_at is
-// strictly before the cutoff. Used by the P8.6 janitor; uploads within the
-// TTL window are left alone (they may be live in-progress writes).
+// strictly before the cutoff. Used by the janitor; uploads within the TTL
+// window are left alone (they may be live in-progress writes).
 func (s *Store) StaleMultipartUploads(ctx context.Context, before time.Time) ([]MultipartUpload, error) {
 	rows, err := s.read.QueryContext(ctx, `SELECT upload_id, bucket, key, content_type, created_at FROM multipart_uploads WHERE created_at < ? ORDER BY created_at`, before.UTC().Format(time.RFC3339Nano))
 	if err != nil {
@@ -714,26 +642,53 @@ func (s *Store) StaleMultipartUploads(ctx context.Context, before time.Time) ([]
 	return uploads, rows.Err()
 }
 
+// GetMultipartPartChunks returns the chunk map of a single part, each chunk
+// carrying its replica list.
 func (s *Store) GetMultipartPartChunks(ctx context.Context, uploadID string, partNumber int) ([]Chunk, error) {
-	rows, err := s.read.QueryContext(ctx, `SELECT seq, telegram_file_id, telegram_message_id, size, transport, bot_index FROM multipart_part_chunks WHERE upload_id = ? AND part_number = ? ORDER BY seq`, uploadID, partNumber)
+	rows, err := s.read.QueryContext(ctx, `SELECT seq, size FROM multipart_part_chunks WHERE upload_id = ? AND part_number = ? ORDER BY seq`, uploadID, partNumber)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var chunks []Chunk
+	idxBySeq := map[int]int{}
 	for rows.Next() {
 		var c Chunk
-		if err := rows.Scan(&c.Seq, &c.FileID, &c.MessageID, &c.Size, &c.Transport, &c.BotIndex); err != nil {
+		if err := rows.Scan(&c.Seq, &c.Size); err != nil {
 			return nil, err
 		}
+		idxBySeq[c.Seq] = len(chunks)
 		chunks = append(chunks, c)
 	}
-	return chunks, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(chunks) == 0 {
+		return nil, nil
+	}
+
+	rrows, err := s.read.QueryContext(ctx, `SELECT seq, provider, locator, delete_token FROM multipart_part_chunk_replicas WHERE upload_id = ? AND part_number = ? ORDER BY seq, replica_idx`, uploadID, partNumber)
+	if err != nil {
+		return nil, err
+	}
+	defer rrows.Close()
+	for rrows.Next() {
+		var seq int
+		var r Replica
+		if err := rrows.Scan(&seq, &r.Provider, &r.Locator, &r.DeleteToken); err != nil {
+			return nil, err
+		}
+		r.Alive = true
+		if ci, ok := idxBySeq[seq]; ok {
+			chunks[ci].Replicas = append(chunks[ci].Replicas, r)
+		}
+	}
+	return chunks, rrows.Err()
 }
 
-// PutMultipartPart replaces a part and its chunk list atomically (re-uploading
-// the same part number is allowed by S3; the caller reaps the old chunks'
-// Telegram messages, having read them first).
+// PutMultipartPart replaces a part and its chunk/replica list atomically
+// (re-uploading the same part number is allowed by S3; the caller reaps the old
+// chunks' blobs, having read them first).
 func (s *Store) PutMultipartPart(ctx context.Context, uploadID string, partNumber int, etag string, size int64, chunks []Chunk) error {
 	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
@@ -745,17 +700,22 @@ func (s *Store) PutMultipartPart(ctx context.Context, uploadID string, partNumbe
 ON CONFLICT(upload_id, part_number) DO UPDATE SET etag = excluded.etag, size = excluded.size`, uploadID, partNumber, etag, size); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM multipart_part_chunk_replicas WHERE upload_id = ? AND part_number = ?`, uploadID, partNumber); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM multipart_part_chunks WHERE upload_id = ? AND part_number = ?`, uploadID, partNumber); err != nil {
 		return err
 	}
 	for _, c := range chunks {
-		transport := c.Transport
-		if transport == "" {
-			transport = "bot"
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO multipart_part_chunks(upload_id, part_number, seq, telegram_file_id, telegram_message_id, size, transport, bot_index) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-			uploadID, partNumber, c.Seq, c.FileID, c.MessageID, c.Size, transport, c.BotIndex); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO multipart_part_chunks(upload_id, part_number, seq, size) VALUES(?, ?, ?, ?)`,
+			uploadID, partNumber, c.Seq, c.Size); err != nil {
 			return err
+		}
+		for ri, r := range c.Replicas {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO multipart_part_chunk_replicas(upload_id, part_number, seq, replica_idx, provider, locator, delete_token) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+				uploadID, partNumber, c.Seq, ri, r.Provider, r.Locator, r.DeleteToken); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()
@@ -778,29 +738,56 @@ func (s *Store) ListMultipartParts(ctx context.Context, uploadID string) ([]Mult
 	return parts, rows.Err()
 }
 
-// AllMultipartChunks returns every chunk across all parts (for abort cleanup).
-// Transport and BotIndex are included so the dispatcher routes each delete
-// to the bot that owns the message — under Bot HTTP API a message can only
-// be deleted by the bot that sent it (modulo channel-admin permissions).
+// AllMultipartChunks returns every chunk across all parts (for abort cleanup),
+// each carrying its replica list so the caller can reap every blob.
 func (s *Store) AllMultipartChunks(ctx context.Context, uploadID string) ([]Chunk, error) {
-	rows, err := s.read.QueryContext(ctx, `SELECT telegram_file_id, telegram_message_id, transport, bot_index FROM multipart_part_chunks WHERE upload_id = ? ORDER BY part_number, seq`, uploadID)
+	rows, err := s.read.QueryContext(ctx, `SELECT part_number, seq, size FROM multipart_part_chunks WHERE upload_id = ? ORDER BY part_number, seq`, uploadID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	type pk struct {
+		part, seq int
+	}
 	var chunks []Chunk
+	idxByPK := map[pk]int{}
 	for rows.Next() {
-		var c Chunk
-		if err := rows.Scan(&c.FileID, &c.MessageID, &c.Transport, &c.BotIndex); err != nil {
+		var part, seq int
+		var size int64
+		if err := rows.Scan(&part, &seq, &size); err != nil {
 			return nil, err
 		}
-		chunks = append(chunks, c)
+		idxByPK[pk{part, seq}] = len(chunks)
+		chunks = append(chunks, Chunk{Seq: seq, Size: size})
 	}
-	return chunks, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(chunks) == 0 {
+		return nil, nil
+	}
+
+	rrows, err := s.read.QueryContext(ctx, `SELECT part_number, seq, provider, locator, delete_token FROM multipart_part_chunk_replicas WHERE upload_id = ? ORDER BY part_number, seq, replica_idx`, uploadID)
+	if err != nil {
+		return nil, err
+	}
+	defer rrows.Close()
+	for rrows.Next() {
+		var part, seq int
+		var r Replica
+		if err := rrows.Scan(&part, &seq, &r.Provider, &r.Locator, &r.DeleteToken); err != nil {
+			return nil, err
+		}
+		r.Alive = true
+		if ci, ok := idxByPK[pk{part, seq}]; ok {
+			chunks[ci].Replicas = append(chunks[ci].Replicas, r)
+		}
+	}
+	return chunks, rrows.Err()
 }
 
 // FinalizeMultipartUpload atomically materializes the assembled object (row +
-// chunk map) and drops all multipart bookkeeping for the upload.
+// chunk map + replicas) and drops all multipart bookkeeping for the upload.
 func (s *Store) FinalizeMultipartUpload(ctx context.Context, obj Object, chunks []Chunk, uploadID string) error {
 	now := time.Now().UTC()
 	if obj.CreatedAt.IsZero() {
@@ -834,31 +821,38 @@ func (s *Store) FinalizeMultipartUpload(ctx context.Context, obj Object, chunks 
 // the caller so both PutObject and FinalizeMultipartUpload share this body.
 func upsertObjectRowTx(ctx context.Context, tx *sql.Tx, obj Object) error {
 	_, err := tx.ExecContext(ctx, `
-INSERT INTO objects(bucket, key, size, etag, content_type, telegram_file_id, telegram_message_id, created_at, updated_at, deleted_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+INSERT INTO objects(bucket, key, size, etag, content_type, created_at, updated_at, deleted_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, NULL)
 ON CONFLICT(bucket, key) DO UPDATE SET
   size = excluded.size, etag = excluded.etag, content_type = excluded.content_type,
-  telegram_file_id = excluded.telegram_file_id, telegram_message_id = excluded.telegram_message_id,
   updated_at = excluded.updated_at, deleted_at = NULL
-`, obj.Bucket, obj.Key, obj.Size, obj.ETag, obj.ContentType, obj.TelegramFileID, obj.TelegramMessageID, obj.CreatedAt.Format(time.RFC3339Nano), obj.UpdatedAt.Format(time.RFC3339Nano))
+`, obj.Bucket, obj.Key, obj.Size, obj.ETag, obj.ContentType, obj.CreatedAt.Format(time.RFC3339Nano), obj.UpdatedAt.Format(time.RFC3339Nano))
 	return err
 }
 
-// replaceObjectChunksTx wipes and rewrites the chunk map for one object. An
-// empty transport string defaults to "bot" so a pre-Phase-3 caller that didn't
-// set the column still produces a valid row.
+// replaceObjectChunksTx wipes and rewrites the chunk map + replica rows for one
+// object.
 func replaceObjectChunksTx(ctx context.Context, tx *sql.Tx, bucket, key string, chunks []Chunk) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM chunk_replicas WHERE bucket = ? AND key = ?`, bucket, key); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM object_chunks WHERE bucket = ? AND key = ?`, bucket, key); err != nil {
 		return err
 	}
 	for _, c := range chunks {
-		transport := c.Transport
-		if transport == "" {
-			transport = "bot"
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO object_chunks(bucket, key, part_seq, telegram_file_id, telegram_message_id, size, offset, transport, bot_index) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			bucket, key, c.Seq, c.FileID, c.MessageID, c.Size, c.Offset, transport, c.BotIndex); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO object_chunks(bucket, key, part_seq, size, offset) VALUES(?, ?, ?, ?, ?)`,
+			bucket, key, c.Seq, c.Size, c.Offset); err != nil {
 			return err
+		}
+		for ri, r := range c.Replicas {
+			alive := 1
+			if !r.Alive {
+				alive = 0
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO chunk_replicas(bucket, key, part_seq, replica_idx, provider, locator, delete_token, alive) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+				bucket, key, c.Seq, ri, r.Provider, r.Locator, r.DeleteToken, alive); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -893,8 +887,8 @@ func (s *Store) GetMultipartUploadMetadata(ctx context.Context, uploadID string)
 	return md, rows.Err()
 }
 
-// DeleteMultipartUpload removes all bookkeeping for an upload (abort path,
-// after the caller has reaped the Telegram messages).
+// DeleteMultipartUpload removes all bookkeeping for an upload (abort path, after
+// the caller has reaped the free-host blobs).
 func (s *Store) DeleteMultipartUpload(ctx context.Context, uploadID string) error {
 	tx, err := s.write.BeginTx(ctx, nil)
 	if err != nil {
@@ -907,35 +901,9 @@ func (s *Store) DeleteMultipartUpload(ctx context.Context, uploadID string) erro
 	return tx.Commit()
 }
 
-// --- Phase 4: MTProto session storage --------------------------------------
-
-// LoadSession returns the raw session blob for the given key, or
-// ErrNotFound if no session has been stored yet. The bot's first boot
-// after deploy goes through ErrNotFound, which gotd's session.Loader
-// translates into a fresh auth.importBotAuthorization call.
-func (s *Store) LoadSession(ctx context.Context, key string) ([]byte, error) {
-	var data []byte
-	err := s.read.QueryRowContext(ctx, `SELECT value FROM tg_sessions WHERE key = ?`, key).Scan(&data)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	return data, err
-}
-
-// StoreSession upserts the session blob for the given key. The write
-// goes through the single-conn writer pool so two bots saving the same
-// key cannot tear (gotd's session is a self-consistent blob and a
-// partial overwrite would force a re-auth + flood-control penalty).
-func (s *Store) StoreSession(ctx context.Context, key string, data []byte) error {
-	_, err := s.write.ExecContext(ctx, `
-INSERT INTO tg_sessions(key, value, updated_at) VALUES(?, ?, ?)
-ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-`, key, data, time.Now().UTC().Format(time.RFC3339Nano))
-	return err
-}
-
 func deleteMultipartTx(ctx context.Context, tx *sql.Tx, uploadID string) error {
 	for _, q := range []string{
+		`DELETE FROM multipart_part_chunk_replicas WHERE upload_id = ?`,
 		`DELETE FROM multipart_part_chunks WHERE upload_id = ?`,
 		`DELETE FROM multipart_parts WHERE upload_id = ?`,
 		`DELETE FROM multipart_upload_metadata WHERE upload_id = ?`,
