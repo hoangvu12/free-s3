@@ -1,5 +1,5 @@
 #!/usr/bin/env pwsh
-# Run Ceph s3-tests against the telegram-s3 gateway with the unsupported
+# Run Ceph s3-tests against the free-s3 gateway with the unsupported
 # feature markers filtered out. See S3-COMPAT-ACCEPTANCE.md for context.
 #
 # The marker expression excludes every category the gateway intentionally

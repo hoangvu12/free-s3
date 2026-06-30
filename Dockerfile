@@ -5,16 +5,19 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/telegram-s3 ./cmd/telegram-s3
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/free-s3 ./cmd/free-s3
 
 FROM alpine:3.22
 
-RUN adduser -D -h /app appuser
+# CA certs so the provider HTTPS uploads/downloads validate.
+RUN apk add --no-cache ca-certificates && adduser -D -h /app appuser
 WORKDIR /app
-COPY --from=build /out/telegram-s3 /usr/local/bin/telegram-s3
+COPY --from=build /out/free-s3 /usr/local/bin/free-s3
 
-ENV LISTEN_ADDR=:9000
+ENV LISTEN_ADDR=:9000 \
+    DATABASE_PATH=/app/data/free-s3.db
 EXPOSE 9000
+VOLUME ["/app/data"]
 
 USER appuser
-CMD ["telegram-s3"]
+CMD ["free-s3"]

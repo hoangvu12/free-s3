@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Live acceptance for the Telegram-S3 gateway (real default clients).
-# Self-contained; see S3-COMPAT-ACCEPTANCE.md. Safe: refuses bucket "send",
-# touches only its own throwaway bucket, deletes exactly what it creates.
+# Live acceptance for the free-s3 gateway (real default S3 clients).
+# Self-contained; see S3-COMPAT.md. Touches only its own throwaway bucket and
+# deletes exactly what it creates. Must run against a gateway reachable from a
+# host that can also reach the free-host providers.
 set -uo pipefail
 
-S3_ENDPOINT="${S3_ENDPOINT:-https://s3.nguyenvu.dev}"
-S3_ACCESS_KEY="${S3_ACCESS_KEY:-telegram-s3-local}"
+S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:9000}"
+S3_ACCESS_KEY="${S3_ACCESS_KEY:-free-s3-local}"
 S3_SECRET_KEY="${S3_SECRET_KEY:-}"
-TEST_BUCKET="${TEST_BUCKET:-phase7-accept}"
+TEST_BUCKET="${TEST_BUCKET:-free-s3-accept}"
 ACCEPT_BIG_MIB="${ACCEPT_BIG_MIB:-20}"
 ACCEPT_LIST_N="${ACCEPT_LIST_N:-2500}"
 RUN_RCLONE="${RUN_RCLONE:-1}"
@@ -22,13 +23,12 @@ if [ -z "$S3_SECRET_KEY" ] && [ -f .env ]; then
 fi
 
 [ -n "$S3_SECRET_KEY" ] || { echo "FATAL: set S3_SECRET_ACCESS_KEY in .env (or export S3_SECRET_KEY)"; exit 2; }
-if [ "$TEST_BUCKET" = "send" ]; then echo "FATAL: refusing to run against the 'send' bucket (Gokapi data)"; exit 2; fi
 command -v aws >/dev/null || { echo "FATAL: aws CLI v2 not found"; exit 2; }
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 export AWS_CONFIG_FILE="$WORK/awscfg" AWS_SHARED_CREDENTIALS_FILE="$WORK/awscreds"
 export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" AWS_DEFAULT_REGION=us-east-1
-# path-style only (Gokapi-equivalent). Do NOT touch checksum/payload-signing
+# path-style only. Do NOT touch checksum/payload-signing
 # config: the aws-cli defaults (aws-chunked streaming) are exactly the point.
 aws configure set default.s3.addressing_style path
 B="s3://$TEST_BUCKET"
@@ -95,7 +95,7 @@ echo "$te" | grep -q "NoSuchTagSet" && pass "get-bucket-tagging -> NoSuchTagSet"
 # --- P6 listing/pagination at scale ---------------------------------------
 mkdir -p "$WORK/scale"
 for i in $(seq 1 "$ACCEPT_LIST_N"); do printf 'k' > "$WORK/scale/obj-$(printf '%05d' "$i").txt"; done
-echo "  uploading $ACCEPT_LIST_N keys (each is one Telegram message)..."
+echo "  uploading $ACCEPT_LIST_N keys (each is one small object)..."
 awsx s3 cp "$WORK/scale" "$B/scale/" --recursive >/dev/null 2>&1 && pass "bulk upload $ACCEPT_LIST_N keys" || fail "bulk upload"
 # --page-size forces the gateway's server-side continuation (real IsTruncated
 # + NextContinuationToken paging); the CLI follows every page and aggregates,
@@ -128,5 +128,5 @@ awsx s3api delete-bucket --bucket "$TEST_BUCKET" >/dev/null 2>&1 && pass "delete
 
 echo "============================================================"
 echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped"
-echo "Gokapi Level-3 E2E is manual — see S3-COMPAT-ACCEPTANCE.md §F"
+echo "free-s3: provider durability is verified separately via the live smoke tests"
 [ "$FAIL" -eq 0 ]
