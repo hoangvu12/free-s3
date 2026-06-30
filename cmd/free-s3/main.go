@@ -32,8 +32,30 @@ func main() {
 	}
 	defer store.Close()
 
-	// freehost backend (P0: stub; P4 wires the provider pool + chunk/replicate).
-	backend := freehost.New()
+	// freehost backend: build the provider pool from config, then the
+	// chunk-and-replicate backend over it.
+	httpClient := freehost.NewClient(cfg.HTTPMaxIdleConnsPerHost)
+	providers := freehost.BuildProviders(httpClient, cfg.FreehostProviders, freehost.Credentials{
+		CatboxUserhash:   cfg.CatboxUserhash,
+		PixeldrainAPIKey: cfg.PixeldrainAPIKey,
+		IAAccessKey:      cfg.IAAccessKey,
+		IASecretKey:      cfg.IASecretKey,
+		GofileToken:      cfg.GofileToken,
+	}, logger)
+	for _, p := range providers {
+		logger.Info("freehost provider enabled", "name", p.Name(), "durable", p.Durable(), "max_bytes", p.MaxBytes())
+	}
+	backend, err := freehost.New(freehost.Options{
+		Providers:         providers,
+		ChunkSize:         cfg.ChunkSize,
+		ReplicationFactor: cfg.ReplicationFactor,
+		UploadConcurrency: cfg.UploadConcurrency,
+		Logger:            logger,
+	})
+	if err != nil {
+		logger.Error("init freehost backend", "error", err)
+		os.Exit(1)
+	}
 
 	handler := s3api.NewHandler(cfg, store, backend, logger)
 

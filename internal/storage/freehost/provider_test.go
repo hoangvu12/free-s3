@@ -212,9 +212,3 @@ func TestRangeGetEmulatesWhenServerIgnoresRange(t *testing.T) {
 	}
 }
 
-func TestStubBackendNotImplemented(t *testing.T) {
-	b := New()
-	if _, err := b.Upload(context.Background(), "k", "ct", strings.NewReader("x")); err == nil {
-		t.Fatal("stub Upload should error")
-	}
-}
