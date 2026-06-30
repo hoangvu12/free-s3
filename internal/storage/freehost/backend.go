@@ -234,6 +234,94 @@ func (b *Backend) DeleteBatch(ctx context.Context, refs []storage.ChunkRef) erro
 	return firstErr
 }
 
+// Verify checks a replica is still alive by fetching its first byte. A nil
+// return means the replica served bytes; any error means it is unreachable /
+// pruned. Used by the keep-alive sweep + read-path self-heal.
+func (b *Backend) Verify(ctx context.Context, rep storage.Replica) error {
+	prov := b.pool.get(rep.Provider)
+	if prov == nil {
+		return fmt.Errorf("freehost: provider %q not enabled", rep.Provider)
+	}
+	rc, err := prov.Download(ctx, rep.Locator, 0, 1)
+	if err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(rc, 1))
+	return rc.Close()
+}
+
+// RepairChunk verifies every replica of a chunk, drops the dead ones, and — if
+// fewer than R survive — re-fetches the chunk from a live replica and uploads it
+// to fresh providers to refill R. It returns the updated ref and whether
+// anything changed (so the caller persists only real changes). An error means
+// the chunk could not be repaired (e.g. every replica is dead = data loss).
+func (b *Backend) RepairChunk(ctx context.Context, ref storage.ChunkRef) (storage.ChunkRef, bool, error) {
+	var live []storage.Replica
+	dead := false
+	for _, rep := range ref.Replicas {
+		if err := b.Verify(ctx, rep); err != nil {
+			dead = true
+			b.logger.Warn("freehost: replica dead during sweep", "provider", rep.Provider, "locator", rep.Locator, "error", err)
+			continue
+		}
+		live = append(live, rep)
+	}
+	if len(live) == 0 {
+		return ref, false, errors.New("freehost: all replicas dead, chunk unrecoverable")
+	}
+	if len(live) >= b.replicas && !dead {
+		return ref, false, nil // healthy, nothing to do
+	}
+
+	newReps := append([]storage.Replica(nil), live...)
+	if len(newReps) < b.replicas {
+		rc, err := b.openReplica(ctx, storage.ChunkRef{Size: ref.Size, Replicas: live}, 0, 0)
+		if err != nil {
+			return ref, false, err
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			return ref, false, err
+		}
+		used := map[string]bool{}
+		for _, r := range newReps {
+			used[r.Provider] = true
+		}
+		newReps = append(newReps, b.replicateExtra(ctx, data, used, b.replicas-len(newReps))...)
+	}
+	changed := dead || len(newReps) != len(ref.Replicas)
+	return storage.ChunkRef{Size: ref.Size, Replicas: newReps}, changed, nil
+}
+
+// replicateExtra uploads data to up to `need` fresh providers not already in
+// `used`, returning the new replicas (best-effort: fewer than need if providers
+// are exhausted/failing).
+func (b *Backend) replicateExtra(ctx context.Context, data []byte, used map[string]bool, need int) []storage.Replica {
+	if need <= 0 {
+		return nil
+	}
+	filename := fmt.Sprintf("repair-%s.bin", shortHash(string(data[:min(len(data), 64)])))
+	var out []storage.Replica
+	for _, prov := range b.pool.candidates(int64(len(data))) {
+		if len(out) >= need {
+			break
+		}
+		if used[prov.Name()] {
+			continue
+		}
+		loc, tok, err := prov.Upload(ctx, data, filename, "application/octet-stream")
+		if err != nil {
+			b.pool.markFailed(prov.Name())
+			continue
+		}
+		b.pool.markHealthy(prov.Name())
+		out = append(out, storage.Replica{Provider: prov.Name(), Locator: loc, DeleteToken: tok})
+		used[prov.Name()] = true
+	}
+	return out
+}
+
 // anyDurable reports whether any of the replica providers is durable.
 func anyDurable(p *pool, replicas []storage.Replica) bool {
 	for _, r := range replicas {

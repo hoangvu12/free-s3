@@ -234,6 +234,69 @@ func TestNewRequiresDurableProvider(t *testing.T) {
 	}
 }
 
+func TestRepairChunkRefillsDeadReplica(t *testing.T) {
+	p1 := newFakeProvider("ia", true, 1<<30)
+	p2 := newFakeProvider("fileditch", true, 1<<30)
+	p3 := newFakeProvider("catbox", true, 1<<30)
+	p4 := newFakeProvider("pixeldrain", true, 1<<30)
+	b := newTestBackend(t, 3, 100, p1, p2, p3, p4)
+
+	chunks, err := b.Upload(context.Background(), "k", "ct", strings.NewReader("payload-data"))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	c := chunks[0]
+	if len(c.Replicas) != 3 {
+		t.Fatalf("initial replicas = %d, want 3", len(c.Replicas))
+	}
+
+	// Kill the first replica's blob so it verifies dead.
+	dead := c.Replicas[0]
+	b.pool.get(dead.Provider).(*fakeProvider).Delete(context.Background(), dead.Locator, "")
+
+	newRef, changed, err := b.RepairChunk(context.Background(), refOf(c))
+	if err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected changed=true after killing a replica")
+	}
+	if len(newRef.Replicas) != 3 {
+		t.Fatalf("after repair = %d replicas, want 3 (refilled)", len(newRef.Replicas))
+	}
+	// Every replica in the repaired set must verify alive.
+	for _, rep := range newRef.Replicas {
+		if err := b.Verify(context.Background(), rep); err != nil {
+			t.Fatalf("repaired replica %s not alive: %v", rep.Provider, err)
+		}
+	}
+}
+
+func TestRepairChunkHealthyIsNoop(t *testing.T) {
+	p1 := newFakeProvider("ia", true, 1<<30)
+	p2 := newFakeProvider("fileditch", true, 1<<30)
+	p3 := newFakeProvider("catbox", true, 1<<30)
+	b := newTestBackend(t, 3, 100, p1, p2, p3)
+	chunks, _ := b.Upload(context.Background(), "k", "ct", strings.NewReader("data"))
+	_, changed, err := b.RepairChunk(context.Background(), refOf(chunks[0]))
+	if err != nil || changed {
+		t.Fatalf("healthy chunk: changed=%v err=%v, want no-op", changed, err)
+	}
+}
+
+func TestRepairChunkAllDeadUnrecoverable(t *testing.T) {
+	p1 := newFakeProvider("ia", true, 1<<30)
+	p2 := newFakeProvider("fileditch", true, 1<<30)
+	b := newTestBackend(t, 2, 100, p1, p2)
+	chunks, _ := b.Upload(context.Background(), "k", "ct", strings.NewReader("data"))
+	for _, rep := range chunks[0].Replicas {
+		b.pool.get(rep.Provider).(*fakeProvider).Delete(context.Background(), rep.Locator, "")
+	}
+	if _, _, err := b.RepairChunk(context.Background(), refOf(chunks[0])); err == nil {
+		t.Fatal("expected unrecoverable error when all replicas dead")
+	}
+}
+
 func TestBackendSkipsProvidersTooSmallForChunk(t *testing.T) {
 	big := newFakeProvider("ia", true, 1<<30)
 	small := newFakeProvider("tiny", true, 4) // can't hold a 10-byte chunk

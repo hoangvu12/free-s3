@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"free-s3/internal/config"
+	"free-s3/internal/keepalive"
 	"free-s3/internal/metadata"
 	"free-s3/internal/s3api"
 	"free-s3/internal/storage/freehost"
@@ -65,6 +66,14 @@ func main() {
 	defer cancelJanitor()
 	if cfg.MultipartSweepInterval > 0 {
 		go handler.RunMultipartJanitor(janitorCtx, cfg.MultipartSweepInterval, cfg.MultipartTTL)
+	}
+
+	// Keep-alive + self-heal sweep: re-reads chunks to reset TTLs and refills
+	// any chunk below R from a surviving replica. Disabled when interval <= 0.
+	if cfg.KeepaliveInterval > 0 {
+		sweeper := keepalive.New(store, backend, cfg.KeepaliveInterval, 0, logger)
+		go sweeper.Run(janitorCtx)
+		logger.Info("keepalive sweep enabled", "interval", cfg.KeepaliveInterval.String())
 	}
 
 	server := &http.Server{

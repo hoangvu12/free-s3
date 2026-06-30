@@ -437,6 +437,56 @@ func (s *Store) MarkReplicaDead(ctx context.Context, bucket, key string, partSeq
 	return err
 }
 
+// ObjectKey identifies one object for the keep-alive sweep.
+type ObjectKey struct {
+	Bucket string
+	Key    string
+}
+
+// AllObjectKeys lists every live object (bucket, key) for the keep-alive sweep
+// to iterate. Ordered so a cursor-based sweep can page deterministically.
+func (s *Store) AllObjectKeys(ctx context.Context) ([]ObjectKey, error) {
+	rows, err := s.read.QueryContext(ctx, `SELECT bucket, key FROM objects WHERE deleted_at IS NULL ORDER BY bucket, key`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ObjectKey
+	for rows.Next() {
+		var k ObjectKey
+		if err := rows.Scan(&k.Bucket, &k.Key); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// UpdateChunkReplicas atomically replaces the replica rows for one chunk (the
+// self-heal write-back: surviving replicas plus any freshly re-uploaded ones,
+// all marked alive). replica_idx is reassigned densely from 0.
+func (s *Store) UpdateChunkReplicas(ctx context.Context, bucket, key string, partSeq int, reps []Replica) error {
+	tx, err := s.write.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM chunk_replicas WHERE bucket = ? AND key = ? AND part_seq = ?`, bucket, key, partSeq); err != nil {
+		return err
+	}
+	for i, r := range reps {
+		alive := 1
+		if !r.Alive {
+			alive = 0
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO chunk_replicas(bucket, key, part_seq, replica_idx, provider, locator, delete_token, alive) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+			bucket, key, partSeq, i, r.Provider, r.Locator, r.DeleteToken, alive); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // ListParams drives a single ListObjects / ListObjectsV2 page.
 type ListParams struct {
 	Bucket    string
