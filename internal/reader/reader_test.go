@@ -22,12 +22,12 @@ type fakeSource struct {
 	chunkSize int64
 
 	// Optional knobs:
-	delay      func(chunkIdx int) time.Duration // sleep before returning
-	failAt     int                               // chunk idx that should error; -1 disables
-	failErr    error
-	inFlight   atomic.Int32
+	delay       func(chunkIdx int) time.Duration // sleep before returning
+	failAt      int                              // chunk idx that should error; -1 disables
+	failErr     error
+	inFlight    atomic.Int32
 	maxInFlight atomic.Int32
-	calls      atomic.Int64
+	calls       atomic.Int64
 }
 
 func newFakeSource(size, chunkSize int64) *fakeSource {
@@ -344,8 +344,8 @@ func (b *chunkBackend) Upload(context.Context, string, string, io.Reader) ([]sto
 func (b *chunkBackend) Download(ctx context.Context, ref storage.ChunkRef) (io.ReadCloser, error) {
 	return b.DownloadRange(ctx, ref, 0, 0)
 }
-func (b *chunkBackend) Delete(context.Context, storage.ChunkRef) error           { return nil }
-func (b *chunkBackend) DeleteBatch(context.Context, []storage.ChunkRef) error    { return nil }
+func (b *chunkBackend) Delete(context.Context, storage.ChunkRef) error        { return nil }
+func (b *chunkBackend) DeleteBatch(context.Context, []storage.ChunkRef) error { return nil }
 func (b *chunkBackend) DownloadRange(_ context.Context, ref storage.ChunkRef, off, length int64) (io.ReadCloser, error) {
 	b.calls.Add(1)
 	if refLoc(ref) == b.failOn {
@@ -375,8 +375,8 @@ func buildBlob(start, end int64) []byte { return wantedBytes(start, end) }
 // the upload messages should still stitch bytes together correctly.
 func TestChunkSourceFullReadStraddlesMessages(t *testing.T) {
 	const total = 300
-	const uploadSize = 80     // upload chunks of 80 bytes
-	const prefetchCS = 128    // prefetch reads 128-byte windows
+	const uploadSize = 80  // upload chunks of 80 bytes
+	const prefetchCS = 128 // prefetch reads 128-byte windows
 
 	be := &chunkBackend{blobs: map[string][]byte{}}
 	var locs []ChunkLoc

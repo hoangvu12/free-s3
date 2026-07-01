@@ -93,13 +93,13 @@ func TestLiveTempSh(t *testing.T)  { liveRoundTrip(t, NewTempSh(NewClient(0))) }
 func TestLivePaste(t *testing.T)   { liveRoundTrip(t, NewPasteCNet(NewClient(0))) }
 func TestLiveFilebin(t *testing.T) { liveRoundTrip(t, NewFilebin(NewClient(0))) }
 
-func TestLiveLitterbox(t *testing.T)  { liveRoundTrip(t, NewLitterbox(NewClient(0))) }
-func TestLiveTmpfiles(t *testing.T)   { liveRoundTrip(t, NewTmpfiles(NewClient(0))) }
+func TestLiveLitterbox(t *testing.T)   { liveRoundTrip(t, NewLitterbox(NewClient(0))) }
+func TestLiveTmpfiles(t *testing.T)    { liveRoundTrip(t, NewTmpfiles(NewClient(0))) }
 func TestLiveTmpfileLink(t *testing.T) { liveRoundTrip(t, NewTmpfileLink(NewClient(0))) }
-func TestLiveUguu(t *testing.T)       { liveRoundTrip(t, NewUguu(NewClient(0))) }
-func TestLiveTmpNinja(t *testing.T)   { liveRoundTrip(t, NewTmpNinja(NewClient(0))) }
-func TestLiveDokoMoe(t *testing.T)    { liveRoundTrip(t, NewDokoMoe(NewClient(0))) }
-func TestLiveCockfile(t *testing.T)   { liveRoundTrip(t, NewCockfile(NewClient(0))) }
+func TestLiveUguu(t *testing.T)        { liveRoundTrip(t, NewUguu(NewClient(0))) }
+func TestLiveTmpNinja(t *testing.T)    { liveRoundTrip(t, NewTmpNinja(NewClient(0))) }
+func TestLiveDokoMoe(t *testing.T)     { liveRoundTrip(t, NewDokoMoe(NewClient(0))) }
+func TestLiveCockfile(t *testing.T)    { liveRoundTrip(t, NewCockfile(NewClient(0))) }
 
 func TestLivePixeldrain(t *testing.T) {
 	liveRoundTrip(t, NewPixeldrain(NewClient(0), os.Getenv("PIXELDRAIN_API_KEY")))

@@ -487,6 +487,62 @@ func (s *Store) UpdateChunkReplicas(ctx context.Context, bucket, key string, par
 	return tx.Commit()
 }
 
+// AppendChunkReplica inserts ONE additional replica row for a chunk — the async
+// background-replication write-back (a slow anchor replica that landed after the
+// PUT already returned 200 with its fast replicas). It assigns the next
+// replica_idx and is a no-op when:
+//   - the object no longer exists (deleted), or
+//   - its ETag no longer matches expectETag (overwritten between the PUT
+//     returning and this replica landing), or
+//   - the provider is already a replica of this chunk (idempotent retry).
+//
+// The ETag guard is what makes async replication safe: a late replica can never
+// attach to a different object version's chunk. A dropped replica (object gone /
+// changed) is harmless — the keep-alive sweep refills any chunk below R.
+func (s *Store) AppendChunkReplica(ctx context.Context, bucket, key string, partSeq int, r Replica, expectETag string) error {
+	tx, err := s.write.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var etag string
+	err = tx.QueryRowContext(ctx, `SELECT etag FROM objects WHERE bucket = ? AND key = ?`, bucket, key).Scan(&etag)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // object deleted since the PUT — drop the late replica
+	}
+	if err != nil {
+		return err
+	}
+	if etag != expectETag {
+		return nil // object overwritten since the PUT — drop the late replica
+	}
+
+	var dup int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM chunk_replicas WHERE bucket = ? AND key = ? AND part_seq = ? AND provider = ?`,
+		bucket, key, partSeq, r.Provider).Scan(&dup); err != nil {
+		return err
+	}
+	if dup > 0 {
+		return nil // already a replica (idempotent)
+	}
+
+	var nextIdx int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(replica_idx)+1, 0) FROM chunk_replicas WHERE bucket = ? AND key = ? AND part_seq = ?`,
+		bucket, key, partSeq).Scan(&nextIdx); err != nil {
+		return err
+	}
+	alive := 1
+	if !r.Alive {
+		alive = 0
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO chunk_replicas(bucket, key, part_seq, replica_idx, provider, locator, delete_token, alive) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+		bucket, key, partSeq, nextIdx, r.Provider, r.Locator, r.DeleteToken, alive); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ListParams drives a single ListObjects / ListObjectsV2 page.
 type ListParams struct {
 	Bucket    string

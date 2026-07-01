@@ -79,6 +79,7 @@ See [`.env.example`](.env.example) for the full list. Key variables:
 |---|---|---|
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | — | gateway SigV4 credentials (required) |
 | `REPLICATION_FACTOR` | `3` | distinct providers per chunk (R) |
+| `SYNC_REPLICAS` | `min(2,R)` | replicas confirmed before PUT returns 200; the rest replicate in the background (keeps a slow anchor from timing out the proxy) |
 | `CHUNK_SIZE` | `80MiB` | per-chunk window (under catbox's 200 MB cap) |
 | `FREEHOST_PROVIDERS` | built-in default | enabled providers, priority order |
 | `UPLOAD_CONCURRENCY` | `6` | parallel chunk-replica uploads |

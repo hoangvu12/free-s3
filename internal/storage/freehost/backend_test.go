@@ -22,12 +22,13 @@ type fakeProvider struct {
 	max        int64
 	failUpload bool
 
-	mu      sync.Mutex
-	blobs   map[string][]byte
-	deleted map[string]bool
-	uploads int
-	seq     int
-	stall   bool // when set, Download blocks until ctx is cancelled (simulates a throttled host)
+	mu         sync.Mutex
+	blobs      map[string][]byte
+	deleted    map[string]bool
+	uploads    int
+	seq        int
+	stall      bool          // when set, Download blocks until ctx is cancelled (simulates a throttled host)
+	uploadGate chan struct{} // when non-nil, Upload blocks on it (simulates a slow anchor write)
 }
 
 func (f *fakeProvider) setStall(v bool) {
@@ -44,7 +45,17 @@ func (f *fakeProvider) Name() string    { return f.name }
 func (f *fakeProvider) MaxBytes() int64 { return f.max }
 func (f *fakeProvider) Durable() bool   { return f.durable }
 
-func (f *fakeProvider) Upload(_ context.Context, data []byte, filename, _ string) (string, string, error) {
+func (f *fakeProvider) Upload(ctx context.Context, data []byte, filename, _ string) (string, string, error) {
+	f.mu.Lock()
+	gate := f.uploadGate
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return "", "", ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.uploads++
@@ -282,7 +293,7 @@ func TestDownloadRangeBytesHedgesSlowLead(t *testing.T) {
 	p1 := newFakeProvider("x0.at", true, 1<<30)
 	p2 := newFakeProvider("fileditch", true, 1<<30)
 	b := newTestBackend(t, 2, 100, p1, p2)
-	b.replicaRead = 10 * time.Second   // long backstop: must NOT be what saves us
+	b.replicaRead = 10 * time.Second // long backstop: must NOT be what saves us
 	b.hedgeDelay = 30 * time.Millisecond
 	chunks, err := b.Upload(context.Background(), "k", "ct", strings.NewReader("payload-bytes"))
 	if err != nil {
@@ -320,6 +331,59 @@ func TestDownloadRangeBytesPartialRange(t *testing.T) {
 	}
 	if string(got) != "3456" {
 		t.Fatalf("range read = %q, want %q", got, "3456")
+	}
+}
+
+// TestUploadReplicatedBackgroundsSlowAnchor: with SyncReplicas=2 and a slow
+// (gated) third provider, UploadReplicated must return after the 2 fast replicas
+// (NOT waiting for the slow anchor), and the slow replica must arrive later via
+// onExtra once it completes — proving the PUT no longer blocks on the slow host.
+func TestUploadReplicatedBackgroundsSlowAnchor(t *testing.T) {
+	fast1 := newFakeProvider("fileditch", true, 1<<30)
+	fast2 := newFakeProvider("x0.at", true, 1<<30)
+	slow := newFakeProvider("ia", true, 1<<30)
+	gate := make(chan struct{})
+	slow.uploadGate = gate // blocks until we release it
+
+	b, err := New(Options{Providers: []Provider{fast1, fast2, slow}, ChunkSize: 100, ReplicationFactor: 3, SyncReplicas: 2, UploadConcurrency: 6, Logger: discardLogger()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	var mu sync.Mutex
+	var extras []storage.Replica
+	got := make(chan struct{}, 1)
+	onExtra := func(seq int, rep storage.Replica) {
+		mu.Lock()
+		extras = append(extras, rep)
+		mu.Unlock()
+		got <- struct{}{}
+	}
+
+	chunks, err := b.UploadReplicated(context.Background(), "k", "ct", strings.NewReader("payload-bytes"), onExtra)
+	if err != nil {
+		t.Fatalf("UploadReplicated: %v", err)
+	}
+	if len(chunks) != 1 || len(chunks[0].Replicas) != 2 {
+		t.Fatalf("sync replicas = %d, want 2 (must not wait for the slow anchor)", len(chunks[0].Replicas))
+	}
+	for _, r := range chunks[0].Replicas {
+		if r.Provider == "ia" {
+			t.Fatalf("slow anchor %q must not be in the synchronous replica set", r.Provider)
+		}
+	}
+
+	// Release the slow anchor; its replica must now arrive via onExtra.
+	close(gate)
+	select {
+	case <-got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background anchor replica never delivered via onExtra")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(extras) != 1 || extras[0].Provider != "ia" {
+		t.Fatalf("background extras = %+v, want one ia replica", extras)
 	}
 }
 

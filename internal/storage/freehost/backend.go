@@ -22,24 +22,35 @@ import (
 // chunk to R distinct providers, and reads chunks back from the first healthy
 // replica.
 type Backend struct {
-	pool        *pool
-	chunkSize   int64
-	replicas    int // R
-	uploadConc  int
-	replicaRead time.Duration // per-replica read deadline / backstop (0 = no per-replica cap)
-	hedgeDelay  time.Duration // wait before racing the next replica on a slow lead (0 = no hedging, pure failover)
-	logger      *slog.Logger
+	pool         *pool
+	chunkSize    int64
+	replicas     int // R
+	syncReplicas int // replicas confirmed before Upload returns; the rest replicate in the background
+	uploadConc   int
+	replicaRead  time.Duration   // per-replica read deadline / backstop (0 = no per-replica cap)
+	hedgeDelay   time.Duration   // wait before racing the next replica on a slow lead (0 = no hedging, pure failover)
+	bgCtx        context.Context // server-lifetime ctx for background replication (survives the request)
+	bgWG         sync.WaitGroup  // tracks in-flight background replica uploads for graceful drain
+	logger       *slog.Logger
 }
 
 // Options bundles Backend construction.
 type Options struct {
-	Providers          []Provider
-	ChunkSize          int64
-	ReplicationFactor  int
+	Providers         []Provider
+	ChunkSize         int64
+	ReplicationFactor int
+	// SyncReplicas is how many replicas an upload confirms before returning; the
+	// remaining (ReplicationFactor - SyncReplicas) replicate in the background so
+	// a slow durable anchor (e.g. Internet Archive at ~0.5 MB/s) does not gate the
+	// PUT response. <= 0 or >= ReplicationFactor means fully synchronous.
+	SyncReplicas       int
 	UploadConcurrency  int
 	ReplicaReadTimeout time.Duration
 	ReadHedgeDelay     time.Duration
-	Logger             *slog.Logger
+	// BackgroundCtx bounds background replication lifetime; cancel it on shutdown
+	// to abandon in-flight background uploads. Defaults to context.Background().
+	BackgroundCtx context.Context
+	Logger        *slog.Logger
 }
 
 var _ storage.Backend = (*Backend)(nil)
@@ -60,6 +71,14 @@ func New(opts Options) (*Backend, error) {
 	if opts.UploadConcurrency < 1 {
 		opts.UploadConcurrency = 6
 	}
+	syncReplicas := opts.SyncReplicas
+	if syncReplicas <= 0 || syncReplicas > opts.ReplicationFactor {
+		syncReplicas = opts.ReplicationFactor // fully synchronous
+	}
+	bgCtx := opts.BackgroundCtx
+	if bgCtx == nil {
+		bgCtx = context.Background()
+	}
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -69,20 +88,38 @@ func New(opts Options) (*Backend, error) {
 		return nil, errors.New("freehost: at least one durable provider must be enabled")
 	}
 	return &Backend{
-		pool:        p,
-		chunkSize:   opts.ChunkSize,
-		replicas:    opts.ReplicationFactor,
-		uploadConc:  opts.UploadConcurrency,
-		replicaRead: opts.ReplicaReadTimeout,
-		hedgeDelay:  opts.ReadHedgeDelay,
-		logger:      logger,
+		pool:         p,
+		chunkSize:    opts.ChunkSize,
+		replicas:     opts.ReplicationFactor,
+		syncReplicas: syncReplicas,
+		uploadConc:   opts.UploadConcurrency,
+		replicaRead:  opts.ReplicaReadTimeout,
+		hedgeDelay:   opts.ReadHedgeDelay,
+		bgCtx:        bgCtx,
+		logger:       logger,
 	}, nil
 }
 
 // Upload splits body into chunkSize windows and replicates each window to R
-// distinct providers. It streams the body chunk-by-chunk (one chunkSize buffer
-// at a time) so object size is unbounded by memory.
+// distinct providers, FULLY SYNCHRONOUSLY (waits for all R). Used by paths that
+// want every replica confirmed before returning (copy, multipart parts). It
+// streams the body chunk-by-chunk so object size is unbounded by memory.
 func (b *Backend) Upload(ctx context.Context, name, contentType string, body io.Reader) ([]storage.Chunk, error) {
+	return b.upload(ctx, name, contentType, body, b.replicas, nil)
+}
+
+// UploadReplicated is like Upload but returns as soon as syncReplicas replicas
+// per chunk are confirmed; the remaining replicas (up to R) upload in the
+// BACKGROUND (server-lifetime ctx) so a slow durable anchor does not gate the
+// PUT response. Each background replica that lands is delivered via
+// onExtra(seq, rep) — the caller persists it (e.g. AppendChunkReplica). onExtra
+// is called from background goroutines AFTER this returns; it must be safe for
+// concurrent use and tolerate being called after the object is deleted/changed.
+func (b *Backend) UploadReplicated(ctx context.Context, name, contentType string, body io.Reader, onExtra func(seq int, rep storage.Replica)) ([]storage.Chunk, error) {
+	return b.upload(ctx, name, contentType, body, b.syncReplicas, onExtra)
+}
+
+func (b *Backend) upload(ctx context.Context, name, contentType string, body io.Reader, syncN int, onExtra func(seq int, rep storage.Replica)) ([]storage.Chunk, error) {
 	nameHash := shortHash(name)
 	buf := make([]byte, b.chunkSize)
 	var chunks []storage.Chunk
@@ -93,7 +130,7 @@ func (b *Backend) Upload(ctx context.Context, name, contentType string, body io.
 		if n > 0 {
 			data := make([]byte, n)
 			copy(data, buf[:n])
-			chunk, err := b.uploadChunk(ctx, nameHash, seq, offset, data, contentType)
+			chunk, err := b.uploadChunk(ctx, nameHash, seq, offset, data, contentType, syncN, onExtra)
 			if err != nil {
 				return chunks, err // caller reaps the partial set
 			}
@@ -110,72 +147,128 @@ func (b *Backend) Upload(ctx context.Context, name, contentType string, body io.
 	return chunks, nil
 }
 
-// uploadChunk replicates one chunk to up to R distinct providers, walking the
-// candidate list (durable-first) in concurrency-bounded waves and falling
-// through to fresh providers when one fails. It requires >= 1 successful
-// replica (BUILD-PLAN §3 step 3); fewer than R is tolerated (best-effort
-// durability), but zero fails the whole upload.
-func (b *Backend) uploadChunk(ctx context.Context, nameHash string, seq int, offset int64, data []byte, contentType string) (storage.Chunk, error) {
+// uploadChunk replicates one chunk to R distinct providers, returning once syncN
+// replicas succeed and continuing the rest in the background. It launches up to
+// R candidate uploads concurrently and returns the first syncN successes (the
+// FASTEST providers naturally win, so the slow anchor lands in the background);
+// on a failure it pulls in the next candidate. Provider uploads run on b.bgCtx
+// so they survive the request — a client disconnect aborts only the wait (via
+// ctx), not in-flight replication. Requires >= 1 successful replica; zero fails.
+//
+// When syncN >= R (the synchronous Upload path) it waits for all R and onExtra
+// is never called. When syncN < R, replicas beyond syncN are delivered to
+// onExtra as they land (durability tops up to R in the background).
+func (b *Backend) uploadChunk(ctx context.Context, nameHash string, seq int, offset int64, data []byte, contentType string, syncN int, onExtra func(seq int, rep storage.Replica)) (storage.Chunk, error) {
 	size := int64(len(data))
 	cands := b.pool.candidates(size)
 	if len(cands) == 0 {
 		return storage.Chunk{}, fmt.Errorf("freehost: no provider can hold a %d-byte chunk", size)
 	}
 	filename := fmt.Sprintf("%s.%d.bin", nameHash, seq)
+	if syncN < 1 || syncN > b.replicas {
+		syncN = b.replicas
+	}
 
-	var replicas []storage.Replica
-	i := 0
-	for i < len(cands) && len(replicas) < b.replicas {
-		need := b.replicas - len(replicas)
-		waveSize := need
-		if waveSize > b.uploadConc {
-			waveSize = b.uploadConc
+	type outcome struct {
+		rep storage.Replica
+		ok  bool
+	}
+	results := make(chan outcome, len(cands))
+	var mu sync.Mutex
+	launched := 0
+	// launchNext starts the next unused candidate's upload; caller holds mu.
+	launchNext := func() bool {
+		if launched >= len(cands) {
+			return false
 		}
-		if waveSize > len(cands)-i {
-			waveSize = len(cands) - i
-		}
-		wave := cands[i : i+waveSize]
-		i += waveSize
+		prov := cands[launched]
+		launched++
+		b.bgWG.Add(1)
+		go func() {
+			defer b.bgWG.Done()
+			start := time.Now()
+			loc, tok, err := prov.Upload(b.bgCtx, data, filename, contentType)
+			elapsed := time.Since(start)
+			if err != nil {
+				b.pool.markFailed(prov.Name())
+				b.logger.Warn("freehost: chunk replica upload failed", "provider", prov.Name(), "seq", seq, "bytes", size, "elapsed_ms", elapsed.Milliseconds(), "error", err)
+				results <- outcome{}
+				return
+			}
+			b.pool.markHealthy(prov.Name())
+			b.logger.Info("freehost: chunk replica uploaded", "provider", prov.Name(), "seq", seq, "bytes", size, "elapsed_ms", elapsed.Milliseconds())
+			results <- outcome{rep: storage.Replica{Provider: prov.Name(), Locator: loc, DeleteToken: tok}, ok: true}
+		}()
+		return true
+	}
 
-		type result struct {
-			rep storage.Replica
-			ok  bool
-		}
-		results := make([]result, len(wave))
-		var wg sync.WaitGroup
-		for j, prov := range wave {
-			wg.Add(1)
-			go func(j int, prov Provider) {
-				defer wg.Done()
-				start := time.Now()
-				loc, tok, err := prov.Upload(ctx, data, filename, contentType)
-				elapsed := time.Since(start)
-				if err != nil {
-					b.pool.markFailed(prov.Name())
-					b.logger.Warn("freehost: chunk replica upload failed", "provider", prov.Name(), "seq", seq, "bytes", size, "elapsed_ms", elapsed.Milliseconds(), "error", err)
-					return
+	mu.Lock()
+	for launched < b.replicas && launchNext() {
+	}
+	inflight := launched
+	mu.Unlock()
+
+	// Synchronous phase: collect until syncN succeed (or candidates exhaust).
+	var synced []storage.Replica
+	collected := 0
+	for len(synced) < syncN && collected < inflight {
+		select {
+		case <-ctx.Done():
+			return storage.Chunk{}, ctx.Err() // caller gone; detached uploads finish as orphans
+		case o := <-results:
+			collected++
+			if o.ok {
+				synced = append(synced, o.rep)
+			} else {
+				mu.Lock()
+				if launchNext() {
+					inflight++
 				}
-				b.pool.markHealthy(prov.Name())
-				b.logger.Info("freehost: chunk replica uploaded", "provider", prov.Name(), "seq", seq, "bytes", size, "elapsed_ms", elapsed.Milliseconds())
-				results[j] = result{rep: storage.Replica{Provider: prov.Name(), Locator: loc, DeleteToken: tok}, ok: true}
-			}(j, prov)
-		}
-		wg.Wait()
-		for _, r := range results {
-			if r.ok {
-				replicas = append(replicas, r.rep)
+				mu.Unlock()
 			}
 		}
 	}
-
-	if len(replicas) == 0 {
+	if len(synced) == 0 {
 		return storage.Chunk{}, fmt.Errorf("freehost: all providers failed for chunk %d", seq)
 	}
-	if !anyDurable(b.pool, replicas) {
-		b.logger.Warn("freehost: chunk has no durable replica", "seq", seq, "replicas", len(replicas))
+	if !anyDurable(b.pool, synced) {
+		b.logger.Warn("freehost: chunk sync replicas have no durable member", "seq", seq, "replicas", len(synced))
 	}
-	return storage.Chunk{Seq: seq, Size: size, Offset: offset, Replicas: replicas}, nil
+
+	// Background phase: drain the remaining in-flight uploads (and top up toward R
+	// on failures), delivering extras via onExtra. Always drain even when onExtra
+	// is nil so straggler goroutines don't block on the results channel.
+	remaining := inflight - collected
+	if remaining > 0 {
+		b.bgWG.Add(1)
+		go func(total int) {
+			defer b.bgWG.Done()
+			for remaining > 0 {
+				o := <-results
+				remaining--
+				if o.ok {
+					total++
+					if onExtra != nil {
+						onExtra(seq, o.rep)
+					}
+				} else if total < b.replicas {
+					mu.Lock()
+					if launchNext() {
+						remaining++
+					}
+					mu.Unlock()
+				}
+			}
+		}(len(synced))
+	}
+
+	return storage.Chunk{Seq: seq, Size: size, Offset: offset, Replicas: synced}, nil
 }
+
+// WaitBackground blocks until all in-flight background replica uploads finish.
+// Call on graceful shutdown (after cancelling the background ctx) so pending
+// replications either complete or abort before exit.
+func (b *Backend) WaitBackground() { b.bgWG.Wait() }
 
 // Download returns the whole content of one chunk from its first healthy replica.
 func (b *Backend) Download(ctx context.Context, ref storage.ChunkRef) (io.ReadCloser, error) {
@@ -228,6 +321,7 @@ func (b *Backend) openReplica(ctx context.Context, ref storage.ChunkRef, offset,
 //   - if it hasn't delivered the whole window within hedgeDelay, start the next
 //     replica concurrently and keep racing (and likewise on each error),
 //   - return the FIRST replica to deliver the full window, cancelling the rest.
+//
 // A slow lead therefore costs ~hedgeDelay (e.g. 2s), not the full per-replica
 // deadline, and it is order-independent. Each replica is still backstopped by
 // replicaRead. Because the window is bounded (the reader's prefetch size, e.g.

@@ -60,6 +60,11 @@ type Config struct {
 	// UploadConcurrency bounds parallel chunk-replica uploads. KeepaliveInterval
 	// is the TTL-refresh / self-heal sweep cadence (0 = off).
 	ReplicationFactor int
+	// SyncReplicas is how many replicas a PUT confirms before returning 200; the
+	// remaining (R - SyncReplicas) replicate in the background so a slow durable
+	// anchor (Internet Archive at ~0.5 MB/s) doesn't gate the response and time
+	// out the proxy. Defaults to min(2, R). Set == R for fully-synchronous PUTs.
+	SyncReplicas      int
 	ChunkSize         int64
 	FreehostProviders []string
 	UploadConcurrency int
@@ -92,6 +97,7 @@ func Load() (Config, error) {
 		ReplicaReadTimeout:      getDuration("REPLICA_READ_TIMEOUT", 18*time.Second),
 		ReadHedgeDelay:          getDuration("READ_HEDGE_DELAY", 2*time.Second),
 		ReplicationFactor:       getInt("REPLICATION_FACTOR", 3),
+		SyncReplicas:            getInt("SYNC_REPLICAS", 0), // 0 => min(2, R), resolved after R is known
 		ChunkSize:               getBytes("CHUNK_SIZE", 80<<20),
 		FreehostProviders:       parseCSVList(os.Getenv("FREEHOST_PROVIDERS")),
 		UploadConcurrency:       getInt("UPLOAD_CONCURRENCY", 6),

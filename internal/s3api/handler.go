@@ -238,7 +238,30 @@ func (h *Handler) putObject(ctx context.Context, w http.ResponseWriter, r *http.
 	// bytes reach Telegram; the Gokapi / aws-sdk-go v1 UNSIGNED-PAYLOAD path
 	// passes through untouched — the regression guard.
 	body, hasher := decodeUpload(r)
-	chunks, err := h.backend.Upload(ctx, key, contentType, body)
+
+	// Async background replication: with a fast-anchor backend, Upload returns
+	// once the fast replicas land and the slow durable anchor replicates in the
+	// background. persistExtra appends each background replica to the chunk once
+	// it lands — but only after the object row + its ETag are committed (gated on
+	// `ready`), and AppendChunkReplica re-checks the ETag so a late replica can
+	// never attach to a newer version. A dropped extra is harmless: the keepalive
+	// sweep refills any chunk left below R.
+	ready := make(chan struct{})
+	var committedETag string
+	var persistExtras bool
+	defer close(ready)
+	persistExtra := func(seq int, rep storage.Replica) {
+		<-ready
+		if !persistExtras {
+			return
+		}
+		mr := metadata.Replica{Provider: rep.Provider, Locator: rep.Locator, DeleteToken: rep.DeleteToken, Alive: true}
+		if err := h.store.AppendChunkReplica(context.Background(), bucket, key, seq, mr, committedETag); err != nil && h.logger != nil {
+			h.logger.Warn("async replica persist failed", "bucket", bucket, "key", key, "seq", seq, "provider", rep.Provider, "error", err)
+		}
+	}
+
+	chunks, err := h.uploadReplicated(ctx, key, contentType, body, persistExtra)
 	if err != nil {
 		// Malformed aws-chunked framing (8.3) is a client error, not a
 		// backend failure — map to 400 before the 502 fallthrough. The
@@ -272,8 +295,25 @@ func (h *Handler) putObject(ctx context.Context, w http.ResponseWriter, r *http.
 		return
 	}
 	h.reapSupersededChunks(ctx, oldChunks)
+	// The object (and its ETag) is now committed; release background replica
+	// persists (close(ready) runs on return).
+	committedETag = etag
+	persistExtras = true
 	w.Header().Set("ETag", quoteETag(etag))
 	w.WriteHeader(http.StatusOK)
+}
+
+// uploadReplicated uses the backend's async fast-anchor replication when
+// available (returning after the fast replicas land, background-replicating the
+// slow anchor and delivering each landed replica to onExtra), else falls back to
+// fully synchronous Upload (onExtra never fires).
+func (h *Handler) uploadReplicated(ctx context.Context, key, contentType string, body io.Reader, onExtra func(seq int, rep storage.Replica)) ([]storage.Chunk, error) {
+	if ar, ok := h.backend.(interface {
+		UploadReplicated(context.Context, string, string, io.Reader, func(int, storage.Replica)) ([]storage.Chunk, error)
+	}); ok {
+		return ar.UploadReplicated(ctx, key, contentType, body, onExtra)
+	}
+	return h.backend.Upload(ctx, key, contentType, body)
 }
 
 // reapSupersededChunks best-effort drops the previous version's chunk replicas

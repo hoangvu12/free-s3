@@ -150,6 +150,54 @@ func TestMarkReplicaDead(t *testing.T) {
 	}
 }
 
+// TestAppendChunkReplica covers the async background-replication write-back:
+// an append with the matching ETag adds a replica; a stale ETag or a missing
+// object is a safe no-op; and appending the same provider twice is idempotent.
+func TestAppendChunkReplica(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+	if err := s.CreateBucket(ctx, "b"); err != nil {
+		t.Fatalf("bucket: %v", err)
+	}
+	chunks := []Chunk{{Seq: 0, Size: 5, Offset: 0, Replicas: []Replica{rep("x0.at", "https://x0.at/a", "")}}}
+	if err := s.PutObject(ctx, Object{Bucket: "b", Key: "k", Size: 5, ETag: "e1", ContentType: "application/octet-stream"}, chunks); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	// Matching ETag → appended (idx assigned, provider now present).
+	if err := s.AppendChunkReplica(ctx, "b", "k", 0, rep("ia", "https://archive.org/x", ""), "e1"); err != nil {
+		t.Fatalf("append (match): %v", err)
+	}
+	// Idempotent: same provider again is a no-op (not a duplicate row).
+	if err := s.AppendChunkReplica(ctx, "b", "k", 0, rep("ia", "https://archive.org/x", ""), "e1"); err != nil {
+		t.Fatalf("append (dup): %v", err)
+	}
+	// Stale ETag → dropped (object was "overwritten").
+	if err := s.AppendChunkReplica(ctx, "b", "k", 0, rep("catbox", "https://files.catbox.moe/y", ""), "STALE"); err != nil {
+		t.Fatalf("append (stale): %v", err)
+	}
+	// Missing object → dropped.
+	if err := s.AppendChunkReplica(ctx, "b", "missing", 0, rep("catbox", "https://files.catbox.moe/z", ""), "e1"); err != nil {
+		t.Fatalf("append (missing): %v", err)
+	}
+
+	gc, err := s.GetObjectChunks(ctx, "b", "k")
+	if err != nil {
+		t.Fatalf("get chunks: %v", err)
+	}
+	provs := map[string]int{}
+	for _, r := range gc[0].Replicas {
+		provs[r.Provider]++
+	}
+	if len(gc[0].Replicas) != 2 || provs["x0.at"] != 1 || provs["ia"] != 1 || provs["catbox"] != 0 {
+		t.Fatalf("replicas = %+v; want exactly x0.at + ia (stale/missing dropped)", gc[0].Replicas)
+	}
+}
+
 func TestMultipartPartChunksRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(filepath.Join(t.TempDir(), "t.db"))

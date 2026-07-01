@@ -73,11 +73,11 @@ func TestLoadRequiredFields(t *testing.T) {
 		{
 			name: "optional provider credentials captured",
 			env: map[string]string{
-				"CATBOX_USERHASH":   "abc123",
+				"CATBOX_USERHASH":    "abc123",
 				"PIXELDRAIN_API_KEY": "pdkey",
-				"IA_ACCESS_KEY":     "iak",
-				"IA_SECRET_KEY":     "ias",
-				"GOFILE_TOKEN":      "gft",
+				"IA_ACCESS_KEY":      "iak",
+				"IA_SECRET_KEY":      "ias",
+				"GOFILE_TOKEN":       "gft",
 			},
 			check: func(t *testing.T, c Config) {
 				if c.CatboxUserhash != "abc123" || c.PixeldrainAPIKey != "pdkey" ||

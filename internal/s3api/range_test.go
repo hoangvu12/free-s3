@@ -197,4 +197,3 @@ func TestRangeEmptyObject(t *testing.T) {
 		t.Fatalf("Content-Range = %q, want bytes */0", cr)
 	}
 }
-

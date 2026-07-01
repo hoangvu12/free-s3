@@ -47,13 +47,26 @@ func main() {
 	for _, p := range providers {
 		logger.Info("freehost provider enabled", "name", p.Name(), "durable", p.Durable(), "max_bytes", p.MaxBytes())
 	}
+	// bgCtx bounds background replication (the slow-anchor replica that lands
+	// after a PUT returns 200); cancelled on shutdown to abandon in-flight uploads.
+	bgCtx, cancelBg := context.WithCancel(context.Background())
+	defer cancelBg()
+	syncReplicas := cfg.SyncReplicas
+	if syncReplicas <= 0 { // default: confirm the fast replicas, background the rest
+		syncReplicas = 2
+		if cfg.ReplicationFactor < 2 {
+			syncReplicas = cfg.ReplicationFactor
+		}
+	}
 	backend, err := freehost.New(freehost.Options{
 		Providers:          providers,
 		ChunkSize:          cfg.ChunkSize,
 		ReplicationFactor:  cfg.ReplicationFactor,
+		SyncReplicas:       syncReplicas,
 		UploadConcurrency:  cfg.UploadConcurrency,
 		ReplicaReadTimeout: cfg.ReplicaReadTimeout,
 		ReadHedgeDelay:     cfg.ReadHedgeDelay,
+		BackgroundCtx:      bgCtx,
 		Logger:             logger,
 	})
 	if err != nil {
@@ -89,6 +102,7 @@ func main() {
 		logger.Info("server listening",
 			"addr", cfg.ListenAddr,
 			"replication_factor", cfg.ReplicationFactor,
+			"sync_replicas", syncReplicas,
 		)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("server failed", "error", err)
@@ -106,6 +120,10 @@ func main() {
 	if err := server.Shutdown(ctx); err != nil {
 		logger.Error("shutdown failed", "error", err)
 	}
+	// Let in-flight background replications finish (or abort via cancelBg) so a
+	// just-uploaded object isn't left below its sync-replica count on exit.
+	cancelBg()
+	backend.WaitBackground()
 }
 
 // logLevel reads LOG_LEVEL (debug|info|warn|error, default info). Set to debug

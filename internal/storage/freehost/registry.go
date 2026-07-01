@@ -23,6 +23,7 @@ type Credentials struct {
 //   - blocked from this IP (re-test on the VPS): paste.c-net.org (whole-site 403
 //     Blacklisted), doko.moe (upload connection reset)
 //   - opt-in-only (token-gated / docs-derived): gofile, buzzheavier
+//
 // (fars.ee was dropped entirely: it is a ptpb/pb text pastebin that forbids
 // large files, not a file host.)
 // temp.sh and filebin.net initially served HTML on read; their adapters now do
